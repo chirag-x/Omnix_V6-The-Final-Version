@@ -68,6 +68,9 @@ class ExecutionTrace:
     synchronization_observation_id: Optional[str] = None
     synchronization_elapsed_ms: float = 0.0
     synchronization_poll_count: int = 0
+    # NEW: Recovery trace
+    recovery_id: Optional[str] = None
+    recovery_outcome: Optional[str] = None   # e.g., "success", "failed", "skipped"
 
 
 @dataclass(frozen=True)
