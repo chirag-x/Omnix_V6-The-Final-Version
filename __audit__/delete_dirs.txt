@@ -1,0 +1,7 @@
+assets/animations
+assets/icons
+assets/sounds
+vision/summary
+vision/utils
+voice/contracts
+temp/pycache

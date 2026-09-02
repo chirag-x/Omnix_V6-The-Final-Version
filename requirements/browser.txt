@@ -1,0 +1,12 @@
+# Omnix V6 — Browser Foundation (Phase 8)
+#
+# The V6 browser subsystem uses Playwright for real browser automation
+# (chromium / firefox / webkit).  All test code targets Playwright's
+# BrowserContext / Page / Locator surface; the in-memory fake in
+# tests/browser_fakes.py duck-types that surface so unit tests run
+# without spawning a real browser.
+#
+# Note: Phase 3 originally specified selenium.  V6 Phase 8 supersedes
+# that decision; the requirements file follows the implementation.
+
+playwright==1.62.0

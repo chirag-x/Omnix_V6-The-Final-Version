@@ -1,0 +1,36 @@
+# Omnix V6 — Core Runtime
+# Phase 0.5: Foundation install
+# Verified against Python 3.13.15 / Windows 11 / CUDA 13.2 driver (RTX 5060)
+#
+# Purpose: get OmnixEngine importable, main.py bootable to "OMNIX V6 IS READY".
+# No ML, no voice, no vision, no browser, no automation.
+# Tier upgrades (ai, vision, voice, automation, browser, ui) come in later phases.
+
+# --- Logging / observability ---
+loguru==0.7.3
+rich==14.3.3
+
+# --- Data validation ---
+pydantic==2.12.5
+pydantic-core==2.41.5
+annotated-types==0.7.0
+
+# --- HTTP / async ---
+requests==2.32.5
+httpx==0.28.1
+
+# --- Process / system introspection ---
+psutil==7.2.2
+
+# --- Windows API ---
+pywin32==311
+comtypes==1.4.16
+
+# --- Window listing (pure-Python) ---
+pygetwindow==0.0.9
+
+# --- .env loading ---
+python-dotenv==1.1.1
+
+# --- Path utilities ---
+pathlib2==2.3.7

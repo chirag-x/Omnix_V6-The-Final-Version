@@ -1,0 +1,10 @@
+# Omnix V6 — Development / Testing
+# Phase 5 (CI + acceptance tests)
+# CI gating: `pytest -m "not real_windows and not voice and not vision"` is the
+# fast lane. Real-Windows / voice / vision tests require marker gates and a
+# host with the right hardware (see docs/V6_ACCEPTANCE_TESTS.md).
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-mock==3.14.0
+pytest-timeout==2.4.0

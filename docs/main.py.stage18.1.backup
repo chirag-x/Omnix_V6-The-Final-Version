@@ -1,0 +1,2647 @@
+"""
+OMNIX V6 — User Runtime + Manual Test Interface (Phase 11.5).
+
+This module is a *thin front door* onto the canonical V6 architecture.
+It does NOT implement Brain logic, Agent logic, or any second execution
+pipeline.  All real work is delegated to the existing
+:class:`core.omnix_engine.OmnixEngine` and its services.
+
+Run with no arguments to enter the interactive text runtime:
+
+    python main.py
+
+Subcommands
+-----------
+
+    python main.py                      # interactive text REPL
+    python main.py process "hello"      # run one request and print the result
+    python main.py health               # print engine + subsystem health
+    python main.py stats                # print engine statistics
+    python main.py voice                # one voice turn (mic + engine + TTS)
+    python main.py voice --turns N      # N voice turns
+    python main.py --llm-health         # probe the LLM provider
+    python main.py --help               # this help
+
+Interactive commands
+--------------------
+
+    /help       show this help inside the REPL
+    /health     engine + subsystem health snapshot
+    /stats      engine statistics
+    /process T  one-shot process of text T (debug aid)
+    /voice      one voice turn from inside the REPL
+    /clear      clear the screen
+    /quit       leave the REPL (also: /exit, /q)
+    Ctrl+C      same as /quit
+
+The CLI is intentionally minimal.  Every natural-language line typed
+in the REPL is forwarded directly to ``engine.process(text)``.  There
+is NO hard-coded command routing in this file.  See
+``docs/V6_PHASE_11_5_USER_RUNTIME_REPORT.md`` for the full contract.
+
+The CLI never imports: ``pyautogui``, ``subprocess``, ``win32gui``,
+``win32api``, BrowserService internals, Vision internals,
+:class:`MemoryStore`, or OpenRouterProvider internals.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
+
+from loguru import logger
+
+# ---------------------------------------------------------------------------
+# Public surface
+# ---------------------------------------------------------------------------
+
+# Re-exports kept for backward compatibility with Phase 6D.1 tests
+# (tests/test_main_llm_health.py) that import these by name.
+__all__ = [
+    "boot_engine",
+    "run_cli",
+    "build_engine",
+    "build_parser",
+    "main",
+    "print_health",
+    "print_stats",
+    "print_interactive_help",
+    "run_repl",
+    "run_unified_interactive",
+    "run_voice_cli",
+    "run_process_cli",
+    "run_health_cli",
+    "run_stats_cli",
+    "run_llm_health_cli",
+    "format_response",
+    "redact_secrets",
+    "_run_llm_health",  # legacy name; see alias below
+    "_parse_argv",  # legacy name; see alias below
+    "_build_engine",  # legacy name; see alias below
+]
+
+
+# ---------------------------------------------------------------------------
+# Boot the engine
+# ---------------------------------------------------------------------------
+
+
+def _silence_third_party_noise() -> None:
+    """R-18: silence noisy dependencies unless explicitly debugged."""
+    import warnings
+
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def build_engine(
+    base_dir: Optional[Path] = None,
+    *,
+    quiet: bool = True,
+    headless: Optional[bool] = None,
+) -> Tuple[Any, Any]:
+    """Load configuration, instantiate :class:`OmnixEngine`, boot it.
+
+    Returns ``(config, engine)``.  Raises on fatal boot failure.
+    This is the *only* place in the CLI that touches the engine.  The
+    rest of the runtime uses ``engine.process()`` /
+    ``engine.statistics()`` / ``engine.health`` exclusively.
+    """
+    from core.configuration import load, configure_logging
+    from core.omnix_engine import OmnixEngine
+
+    if base_dir is None:
+        base_dir = Path.cwd()
+    config = load(base_dir)
+    configure_logging(config)
+
+    if quiet:
+        logger.disable("core")
+
+    if not quiet:
+        logger.info("Initializing Omnix V6 Engine Sequence...")
+        if os.getenv("OMNIX_HEADLESS", "0").strip() == "1":
+            logger.info("Engine running in HEADLESS mode (no physical UX allowed)")
+
+    if headless is True:
+        os.environ["OMNIX_HEADLESS"] = "1"
+    elif headless is False:
+        os.environ.pop("OMNIX_HEADLESS", None)
+
+    engine = OmnixEngine(config)
+    if not engine.initialize():
+        raise RuntimeError("OmnixEngine.initialize() returned False")
+    engine.start()
+    return config, engine
+
+
+# Backward-compat alias for tests that imported the legacy name.
+def _build_engine(base_dir: Path, quiet: bool) -> Tuple[Any, Any]:  # pragma: no cover
+    return build_engine(base_dir, quiet=quiet)
+
+
+def boot_engine(
+    base_dir: Optional[Path] = None,
+    *,
+    headless: bool = False,
+    quiet: bool = False,
+) -> int:
+    """Initialize the engine and return without entering the CLI.
+
+    Returns 0 on clean shutdown, 1 on failure.  Kept for compatibility
+    with the Phase 1 boot path and headless CI smoke tests.
+    """
+    if base_dir is None:
+        base_dir = Path.cwd()
+    _silence_third_party_noise()
+    try:
+        _, engine = build_engine(base_dir, quiet=quiet, headless=headless or None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 1
+    if not quiet:
+        logger.info("===================================")
+        logger.info("       OMNIX AI IS READY           ")
+        logger.info("===================================")
+    print_health(engine, debug=False)
+    engine.stop()
+    return 0
+
+
+def _print_readiness_report(engine: Any) -> None:
+    """Print the engine's Phase 15 readiness report.  Honours the
+    canonical ``ReadinessReport.pretty()`` formatter when available
+    and falls back to a minimal one-line per-item summary."""
+    try:
+        report = engine.readiness_report()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[readiness] report unavailable: {exc!r}")
+        return
+    pretty = getattr(report, "pretty", None)
+    if callable(pretty):
+        try:
+            print(pretty())
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    items = getattr(report, "items", ()) or ()
+    is_ready = bool(getattr(report, "is_ready", False))
+    print("=" * 60)
+    print(f"OMNIX V6 READINESS  (is_ready={is_ready})")
+    print("=" * 60)
+    for item in items:
+        ready = "OK" if getattr(item, "ready", False) else "--"
+        cls = getattr(item, "classification", "?")
+        name = getattr(item, "name", "?")
+        detail = getattr(item, "detail", "")
+        dur = getattr(item, "duration_ms", 0.0) or 0.0
+        print(f"  [{ready:<2}] {cls:<10} {name:<24} {dur:6.1f}ms  {detail}")
+    print("=" * 60)
+
+
+def _connect_engine_tts(engine: Any) -> bool:
+    """Wire the engine-owned :class:`SpeechQueue` to the SAPI TTS
+    provider.  Returns ``True`` if the connection was made.  The
+    call is best-effort: any failure is logged and the engine
+    remains usable without TTS."""
+    try:
+        from voice.tts.sapi_provider import SAPITTSProvider
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"SAPI TTS provider unavailable: {exc!r}")
+        return False
+    try:
+        provider = SAPITTSProvider()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"SAPI TTS construction failed: {exc!r}")
+        return False
+    try:
+        ok = engine.connect_tts(provider)
+        if ok:
+            logger.info("SpeechQueue connected to SAPI TTS.")
+        return bool(ok)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"engine.connect_tts raised: {exc!r}")
+        return False
+
+
+def run_boot_cli(
+    engine: Any,
+    *,
+    headless: bool = False,
+    quiet: bool = False,
+    speak: bool = True,
+) -> int:
+    """Phase 15 ``--boot`` flow: print the readiness report, enqueue
+    the startup announcement (only if every critical subsystem is
+    READY), wait for the announcement to be spoken, then return
+    without entering the REPL.
+
+    ``speak=False`` skips the announcement and TTS wiring — useful
+    for headless CI tests.  ``headless=True`` is honoured by the
+    :func:`boot_engine` caller; here it only suppresses the TTS
+    wiring when ``speak`` is also ``False``.
+    """
+    _print_readiness_report(engine)
+    if not engine.readiness_report().is_ready:
+        if not quiet:
+            print(
+                "[boot] not all CRITICAL subsystems are READY; "
+                "skipping announcement."
+            )
+        return 2
+    if speak and not headless:
+        tts_ok = _connect_engine_tts(engine)
+        if tts_ok:
+            try:
+                engine.announce_ready()
+                # Wait briefly for the announcement to be spoken.
+                engine.wait_speech_idle(timeout_s=8.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"announce_ready raised: {exc!r}")
+    elif not speak:
+        if not quiet:
+            print("[boot] --no-speak: skipping announcement and TTS wiring.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+# ---------------------------------------------------------------------------
+
+# Tokens we never want to see in CLI output, even by accident.
+# Any line containing one of these is replaced wholesale with a
+# fixed, safe message.  This is the LAST line of defence; the engine
+# itself never returns secrets.
+_SECRET_PATTERNS = (
+    "sk-",
+    "sk_live_",
+    "Bearer ",
+    "bearer ",
+    "api_key=",
+    "apikey=",
+    "password=",
+    "token=",
+    "OPENROUTER_API_KEY=",
+    "GROQ_API_KEY=",
+)
+
+
+def redact_secrets(text: str, *, replacement: str = "[REDACTED]") -> str:
+    """Replace any line that smells like a secret with a safe marker.
+
+    Phase 11.5 hardening: the CLI is the only place the user sees raw
+    strings, so it is the right place to do final redaction.  This is
+    intentionally permissive (any line containing a forbidden token is
+    redacted) — losing one line of harmless text is far better than
+    leaking a key.
+    """
+    if not isinstance(text, str):
+        return replacement
+    if not text:
+        return text
+    out_lines: List[str] = []
+    for raw in text.splitlines():
+        low = raw.lower()
+        if any(pat.lower() in low for pat in _SECRET_PATTERNS):
+            out_lines.append(replacement)
+        else:
+            out_lines.append(raw)
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+_BANNER = (
+    "=============================================================\n"
+    "  OMNIX V6 — Voice & Automation Runtime\n"
+    "  Type your request, or /help for commands, /quit to exit.\n"
+    "============================================================="
+)
+
+
+def print_interactive_help() -> None:
+    """Print the REPL help text."""
+    print(
+        "Interactive commands:\n"
+        "  /help        show this help\n"
+        "  /health      engine + subsystem health snapshot\n"
+        "  /stats       engine statistics (request counts, capabilities, ...)\n"
+        "  /process T   run text T through engine.process() once (debug aid)\n"
+        "  /voice       one voice turn: listen -> process -> speak\n"
+        "  /clear       clear the screen\n"
+        "  /quit        leave the REPL  (also: /exit, /q, Ctrl+C)\n"
+        "\n"
+        "Any other line is treated as a natural-language request and\n"
+        "sent directly to engine.process().  The response text is\n"
+        "spoken via TTS when voice is enabled and printed otherwise."
+    )
+
+
+def print_health(engine: Any, *, debug: bool = False) -> None:
+    """Print a compact health snapshot.  Never includes secrets."""
+    try:
+        stats = engine.statistics()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[health] error collecting statistics: {exc!r}")
+        return
+
+    print("=" * 60)
+    print("OMNIX AI ENGINE HEALTH")
+    print("=" * 60)
+    print(f"  type           : {stats.get('type')}")
+    print(f"  lifecycle      : {stats.get('lifecycle')}")
+    print(f"  request_count  : {stats.get('request_count')}")
+    print(f"  executions     : {stats.get('execution_count')}")
+    print(f"  pipeline       : {stats.get('pipeline_available')}")
+    print(f"  capabilities   : {stats.get('capabilities_loaded')}")
+
+    services = stats.get("services", {}) or {}
+    counts = services.get("counts", {}) or {}
+    # The canonical :class:`ServiceRegistry.statistics()` returns the
+    # registered / initialised counts as top-level fields.  The richer
+    # ``health()`` shape nests them under ``counts``.  Honour both.
+    if counts:
+        registered = counts.get("registered", 0)
+        initialized = counts.get("initialized", 0)
+    else:
+        registered = services.get("registered", 0)
+        initialized = services.get("initialized", 0)
+    print(f"  service_state  : {services.get('lifecycle')}")
+    print(f"  services       : " f"{initialized}/{registered} initialized")
+
+    subsystems = (stats.get("health_report", {}) or {}).get("subsystems", {}) or {}
+    for name in ("pipeline", "brain", "agent", "llm_provider"):
+        sub = subsystems.get(name)
+        if sub is None:
+            continue
+        if isinstance(sub, dict):
+            # The canonical SubsystemHealth.to_dict() exposes
+            # ``status`` and ``lifecycle``.  Prefer those; fall back
+            # to whatever the subsystem chose to surface.
+            status = sub.get("status", "?")
+            lifecycle = sub.get("lifecycle", "")
+            if lifecycle and lifecycle not in ("unknown", ""):
+                line = f"{status} ({lifecycle})"
+            else:
+                line = str(status)
+        else:
+            line = "?"
+        print(f"  subsystem:{name:<13}: {line}")
+
+    if debug:
+        # Debug: also include the memory statistics and the LLM
+        # provider's statistics().  Never include the API key.
+        mem = stats.get("memory")
+        if isinstance(mem, dict):
+            print(f"  memory         : {mem.get('type', '?')}")
+            for k, v in mem.items():
+                if k == "type":
+                    continue
+                print(f"    {k:<13}: {v}")
+        llm = subsystems.get("llm_provider") if isinstance(subsystems, dict) else None
+        if isinstance(llm, dict):
+            llm_stats = llm.get("statistics") or llm.get("stats") or {}
+            if isinstance(llm_stats, dict):
+                print(f"  llm.model      : {llm_stats.get('model', '')}")
+                print(f"  llm.calls      : {llm_stats.get('call_count', 0)}")
+                print(f"  llm.errors     : {llm_stats.get('error_count', 0)}")
+    print("=" * 60)
+
+
+def print_stats(engine: Any, *, debug: bool = False) -> None:
+    """Print engine statistics()."""
+    try:
+        stats = engine.statistics()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[stats] error collecting statistics: {exc!r}")
+        return
+    safe = json.dumps(stats, indent=2, default=str)
+    print(redact_secrets(safe))
+
+
+def format_response(response: Any, *, debug: bool = False) -> str:
+    """Render an :class:`OmnixResponse` for the CLI.
+
+    In normal mode: print only the user-facing ``text`` field.
+    In debug mode: also include ``status``, ``duration_ms``, and
+    ``correlation_id`` (the latter is shown only when debug is on).
+    """
+    if response is None:
+        return "(no response)"
+    text = getattr(response, "text", "") or ""
+    if debug:
+        cid = getattr(response, "correlation_id", "") or ""
+        status = getattr(response, "status", None)
+        status_str = status.value if hasattr(status, "value") else str(status)
+        dur = getattr(response, "duration_ms", 0.0) or 0.0
+        head = f"[{status_str} | {dur:.0f}ms | cid={cid}]"
+        text = f"{head}\n{text}"
+    return redact_secrets(text)
+
+
+# ---------------------------------------------------------------------------
+# Voice subcommand
+# ---------------------------------------------------------------------------
+
+
+def _make_voice_service(engine: Any) -> Any:
+    """Build the canonical :class:`VoiceService` for the CLI.
+
+    Voice is OPTIONAL.  If the module is not importable in this
+    environment (e.g. faster-whisper is missing) we return ``None``
+    and the caller degrades gracefully.
+    """
+    try:
+        from voice.service import VoiceService
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"VoiceService import failed: {exc!r}")
+        return None
+    try:
+        return VoiceService(engine=engine)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"VoiceService construction failed: {exc!r}")
+        return None
+
+
+def run_voice_cli(
+    engine: Any,
+    *,
+    max_turns: int = 1,
+    debug: bool = False,
+) -> int:
+    """Run the voice loop for ``max_turns`` turns.  Returns 0 on success."""
+    if max_turns <= 0:
+        print("[voice] no turns requested")
+        return 0
+    svc = _make_voice_service(engine)
+    if svc is None:
+        print(
+            "[voice] VoiceService is not available in this environment; "
+            "the voice subsystem is OPTIONAL."
+        )
+        return 0
+    # Phase 15: hand the engine-owned SpeechQueue to the voice
+    # service so real-time progress narration and the result
+    # utterance flow through the SAME ordered, deduplicated queue
+    # instead of being spoken inline.  Wire the SAPI TTS to the
+    # engine's queue worker so anything the queue dequeues is
+    # actually rendered as audio.
+    try:
+        if getattr(engine, "speech_queue", None) is not None:
+            try:
+                svc._speech_queue = engine.speech_queue
+            except Exception:  # noqa: BLE001
+                pass
+            _connect_engine_tts(engine)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        svc.initialize()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] initialize() failed: {exc!r}")
+        return 0
+    try:
+        print(f"[voice] running {max_turns} voice turn(s); speak when prompted.")
+        completed = svc.run_voice_loop(max_turns=max_turns)
+        print(f"[voice] {completed}/{max_turns} turn(s) completed successfully.")
+        return 0
+    except KeyboardInterrupt:
+        print("\n[voice] interrupted.")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] voice loop failed: {exc!r}")
+        return 0
+    finally:
+        try:
+            svc.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
+# One-shot process / health / stats subcommands
+# ---------------------------------------------------------------------------
+
+
+def run_process_cli(
+    engine: Any,
+    text: str,
+    *,
+    debug: bool = False,
+) -> int:
+    """Run ``engine.process(text)`` once and print the result."""
+    if not text or not str(text).strip():
+        print("[error] empty input; provide a non-empty text argument.")
+        return 2
+    try:
+        response = engine.process(text)
+    except KeyboardInterrupt:
+        print("[process] interrupted.")
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] engine.process() raised: {exc!r}")
+        return 1
+    print(format_response(response, debug=debug))
+    err = getattr(response, "error", None)
+    status = getattr(response, "status", None)
+    if status is not None and hasattr(status, "value"):
+        sval = status.value
+        if sval in ("failed", "timeout", "cancelled", "rejected") and err:
+            return 1
+    return 0
+
+
+def run_health_cli(engine: Any, *, debug: bool = False) -> int:
+    print_health(engine, debug=debug)
+    return 0
+
+
+def run_stats_cli(engine: Any, *, debug: bool = False) -> int:
+    print_stats(engine, debug=debug)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# LLM health probe (Phase 6D.1 — kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+
+def run_llm_health_cli(
+    *,
+    offline: bool = False,
+    provider_override: Optional[str] = None,
+) -> int:
+    """Phase 6D.1: probe the configured LLM provider and exit.
+
+    Exit codes: 0 = ok (or skipped in offline/mock mode), 2 = probe
+    failure, 3 = config error.  No key value is ever printed.
+    """
+    _silence_third_party_noise()
+    try:
+        config, engine = build_engine(Path.cwd(), quiet=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 3
+    # Snapshot the prior env value so the override we apply below is
+    # restored exactly when we leave -- this CLI must not leak process-
+    # level state into the test suite (or the user's shell).
+    _prior_provider = os.environ.get("OMNIX_LLM_PROVIDER")
+    try:
+        if provider_override:
+            # ``deterministic`` is the dev alias for the mock provider.
+            canonical = (
+                "mock"
+                if provider_override.lower() in ("deterministic", "mock")
+                else provider_override
+            )
+            os.environ["OMNIX_LLM_PROVIDER"] = canonical
+        return _run_llm_health(config, engine, offline=offline)
+    finally:
+        # Restore the prior env value (or remove the key entirely if it
+        # wasn't set before).  Failing to do this leaked a process-level
+        # ``OMNIX_LLM_PROVIDER=mock`` into the test suite and broke
+        # any later test that resolved a provider by config alone.
+        try:
+            if _prior_provider is None:
+                os.environ.pop("OMNIX_LLM_PROVIDER", None)
+            else:
+                os.environ["OMNIX_LLM_PROVIDER"] = _prior_provider
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            engine.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_llm_health(
+    config: Any,
+    engine: Any,
+    *,
+    offline: bool = False,
+) -> int:
+    """Probe the configured LLM provider and print a structured report.
+
+    This command closes the loop between "provider constructs" (proved
+    by ``--health``) and "the LLM actually answers" (today only provable
+    in mocked-HTTP tests).  In offline mode (or when the provider is
+    the deterministic :class:`MockProvider`) the command performs no
+    network call and exits 0 once construction succeeds.
+
+    Exit codes:
+
+        0 — provider constructed (and probe succeeded if not offline)
+        2 — provider error during probe (auth, rate limit, timeout, …)
+        3 — configuration error (missing key, unknown model, …)
+
+    No key value is ever printed; only the key *count* and the
+    provider's identity are surfaced.
+    """
+    from ai.provider import (
+        MockProvider,
+        get_provider,
+        LLMRequest,
+        LLMMessage,
+        MessageRole,
+        OutputFormat,
+    )
+    from ai.provider.errors import (
+        ConfigurationError_ as ProviderConfigurationError,
+        ProviderError,
+    )
+
+    print("=" * 60)
+    print("OMNIX V6 LLM HEALTH PROBE")
+    print("=" * 60)
+
+    # 1) Construct the provider.  A ConfigurationError_ here is a
+    #    config issue (exit 3); anything else is a probe failure (2).
+    try:
+        provider = get_provider(config)
+    except ProviderConfigurationError as exc:
+        print(f"  llm_provider   : ERROR: {exc}")
+        print(f"  code           : {getattr(exc, 'code', 'PROVIDER_CONFIG_INVALID')}")
+        print("=" * 60)
+        return 3
+    except Exception as exc:  # noqa: BLE001
+        print(f"  llm_provider   : ERROR: {exc!r}")
+        print("=" * 60)
+        return 3
+
+    provider_name = getattr(provider, "name", type(provider).__name__)
+    model = getattr(provider, "_model", None)
+    key_count = len(getattr(config, "openrouter_keys", ()) or ())
+    base_url = getattr(config, "openrouter_url", "")
+
+    print(f"  llm_provider   : {provider_name}")
+    if model:
+        print(f"  model          : {model}")
+    if key_count:
+        # R-12: never print the key value, only the count.
+        print(f"  api_key_count  : {key_count}")
+    if base_url:
+        print(f"  base_url       : {base_url}")
+
+    is_mock = isinstance(provider, MockProvider)
+
+    # 2) Offline mode: construct-only probe.  Exit 0 immediately.
+    if offline or is_mock:
+        if is_mock:
+            print("  probe          : SKIPPED (MockProvider is offline by design)")
+        else:
+            print("  probe          : SKIPPED (--offline / OMNIX_LLM_DRY_RUN=1)")
+        print("  status         : OK (provider constructed)")
+        print("=" * 60)
+        return 0
+
+    # 3) Live probe: one minimal completion call.  Bounded by
+    #    request-level timeout; provider-level retries still apply.
+    request = LLMRequest(
+        messages=[LLMMessage(role=MessageRole.USER, content="ping")],
+        output_format=OutputFormat.TEXT,
+        max_tokens=8,
+        timeout_s=15.0,
+    )
+    started = time.time()
+    try:
+        response = provider.generate(request)
+    except ProviderError as exc:
+        elapsed = time.time() - started
+        print(f"  probe          : FAILED ({elapsed:.2f}s)")
+        print(f"  code           : {getattr(exc, 'code', 'PROVIDER_ERROR')}")
+        # NEVER print exc.args verbatim — it may carry the bearer key
+        # in a misbehaving upstream.  Use the provider's redacted message.
+        print(f"  message        : {getattr(exc, 'message', str(exc))}")
+        print("=" * 60)
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        elapsed = time.time() - started
+        print(f"  probe          : FAILED ({elapsed:.2f}s)")
+        print(f"  error          : {type(exc).__name__}: {exc}")
+        print("=" * 60)
+        return 2
+
+    elapsed = time.time() - started
+    usage = getattr(response, "usage", None)
+    pt = getattr(usage, "prompt_tokens", None) if usage else None
+    ct = getattr(usage, "completion_tokens", None) if usage else None
+    tt = getattr(usage, "total_tokens", None) if usage else None
+    print(f"  probe          : OK ({elapsed:.2f}s)")
+    print(f"  finish_reason  : {getattr(response, 'finish_reason', None)}")
+    if pt is not None or ct is not None or tt is not None:
+        print(f"  tokens         : prompt={pt} completion={ct} total={tt}")
+    print("=" * 60)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Interactive REPL
+# ---------------------------------------------------------------------------
+
+
+def _read_line(prompt: str) -> Optional[str]:
+    """Read one line from stdin, or return ``None`` on EOF.
+
+    Ctrl+C at the prompt returns ``"exit"`` so the caller can shut
+    down cleanly.
+    """
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+    except KeyboardInterrupt:
+        print()
+        return "exit"
+
+
+def _handle_interactive_line(
+    engine: Any,
+    raw: str,
+    *,
+    debug: bool = False,
+) -> Tuple[bool, int]:
+    """Process one line of REPL input.
+
+    Returns ``(keep_going, exit_code)``:
+      * ``keep_going=False`` means the REPL should exit (e.g. ``/quit``).
+      * ``exit_code`` is the process exit code the REPL should use.
+    """
+    line = (raw or "").strip()
+    if not line:
+        return True, 0
+
+    if line in ("/quit", "/exit", "/q", "exit", "quit", "q"):
+        return False, 0
+    if line in ("/help", "help", "?"):
+        print_interactive_help()
+        return True, 0
+    if line == "/health":
+        print_health(engine, debug=debug)
+        return True, 0
+    if line == "/stats":
+        print_stats(engine, debug=debug)
+        return True, 0
+    if line == "/clear":
+        # ANSI clear; harmless on platforms that ignore it.
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        return True, 0
+    if line == "/voice":
+        run_voice_cli(engine, max_turns=1, debug=debug)
+        return True, 0
+    if line.startswith("/process "):
+        _, _, rest = line.partition(" ")
+        run_process_cli(engine, rest.strip(), debug=debug)
+        return True, 0
+    if line.startswith("/"):
+        print(f"[error] unknown command: {line!r}")
+        print("  type /help for the list of commands.")
+        return True, 0
+
+    # Anything else: natural language.  Hand it to engine.process().
+    # We never branch on the text content (no hard-coded automation).
+    try:
+        response = engine.process(line)
+    except KeyboardInterrupt:
+        print("[process] interrupted.")
+        return True, 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] engine.process() raised: {exc!r}")
+        return True, 0
+    print(format_response(response, debug=debug))
+    return True, 0
+
+
+def run_repl(engine: Any, *, debug: bool = False) -> int:
+    """The interactive text REPL.
+
+    Reads lines from stdin and dispatches them.  Any non-command line
+    is forwarded to ``engine.process()``.  The REPL never crashes on
+    a single bad line; it logs and keeps going.
+
+    Phase 4: a SIGINT handler is installed for the lifetime of each
+    command.  When the user hits Ctrl+C, the handler flips the
+    in-flight ``CancellationToken`` via
+    ``engine.request_cancel_all`` so the Agent loop finalises
+    early with state ``CANCELLED`` instead of being killed.
+    """
+    print(_BANNER)
+    while True:
+        raw = _read_line("You: ")
+        if raw is None:
+            # EOF
+            print()
+            break
+        # Install SIGINT-cancels-in-flight-request handler for the
+        # duration of this command.  We restore the previous
+        # handler afterwards so Ctrl+C still exits the REPL when
+        # no command is running.
+        prev_handler = None
+        try:
+            import signal as _signal
+
+            def _sigint_cancel(_signum, _frame):  # noqa: ANN001
+                try:
+                    engine.request_cancel_all(reason="cancelled by SIGINT")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            prev_handler = _signal.getsignal(_signal.SIGINT)
+            try:
+                _signal.signal(_signal.SIGINT, _sigint_cancel)
+            except (ValueError, OSError):
+                # Signal handlers can only be installed from the
+                # main thread on some platforms — fall back to
+                # KeyboardInterrupt flow.
+                prev_handler = None
+        except Exception:  # noqa: BLE001
+            prev_handler = None
+        try:
+            keep_going, rc = _handle_interactive_line(
+                engine,
+                raw,
+                debug=debug,
+            )
+        except KeyboardInterrupt:
+            print("[cancelled]")
+            keep_going, rc = True, 0
+        except Exception as exc:  # noqa: BLE001
+            # The REPL must never crash on a single line.
+            print(f"[error] {exc!r}")
+            keep_going, rc = True, 0
+        finally:
+            if prev_handler is not None:
+                try:
+                    import signal as _signal
+
+                    _signal.signal(_signal.SIGINT, prev_handler)
+                except Exception:  # noqa: BLE001
+                    pass
+        if not keep_going:
+            return rc
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Unified interactive loop (Part 3) — text REPL with parallel voice
+# ---------------------------------------------------------------------------
+
+
+def _has_voice_runtime(engine: Any) -> bool:
+    """True if the engine has a wired :class:`VoiceRuntime`."""
+    return bool(getattr(engine, "voice_runtime", None))
+
+
+def _is_voice_sleeping(engine: Any) -> bool:
+    """True if the runtime controller is currently asleep / waking."""
+    rt = getattr(engine, "voice_runtime", None)
+    if rt is None:
+        return False
+    try:
+        return bool(getattr(rt.controller, "is_asleep", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wake_engine_voice(engine: Any) -> None:
+    """Transition the runtime from SLEEPING → READY."""
+    rt = getattr(engine, "voice_runtime", None)
+    if rt is None:
+        return
+    try:
+        rt.wake()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"voice_runtime.wake() raised: {exc!r}")
+
+
+def run_unified_interactive(engine: Any, *, debug: bool = False) -> int:
+    """Unified text + voice interactive loop.
+
+    When the engine has a wired :class:`VoiceRuntime`, the
+    wake-word listener and command STT run in the background; the
+    text REPL handles typed input.  Either path can call
+    :meth:`OmnixEngine.request_shutdown` to exit.  When the engine
+    has no voice runtime we fall back to the plain :func:`run_repl`.
+    """
+    if not _has_voice_runtime(engine):
+        return run_repl(engine, debug=debug)
+    print(_BANNER)
+    print(
+        "[voice] Unified runtime active. Say the wake phrase to issue a "
+        "voice command, or type below.  Use /quit to leave."
+    )
+    while True:
+        # Cooperative shutdown: the voice path calls
+        # ``request_shutdown`` when it hears /quit, and the text path
+        # does the same through ``_handle_interactive_line``.
+        if bool(getattr(engine, "_shutdown_requested", False)):
+            print()
+            print("[voice] Shutdown requested. Goodbye.")
+            return 0
+        prompt = (
+            "You (sleeping — say the wake phrase): "
+            if _is_voice_sleeping(engine)
+            else "You: "
+        )
+        raw = _read_line(prompt)
+        if raw is None:
+            print()
+            return 0
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # If the user types ``/wake`` while asleep, transition the
+        # runtime to READY and resume normal prompt.
+        if _is_voice_sleeping(engine) and stripped.lower() in (
+            "/wake",
+            "wake",
+            "i'm back",
+        ):
+            _wake_engine_voice(engine)
+            print("[voice] Awake. Listening for your command.")
+            continue
+        try:
+            keep_going, rc = _handle_interactive_line(
+                engine,
+                raw,
+                debug=debug,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The REPL must never crash on a single line.
+            print(f"[error] {exc!r}")
+            continue
+        if not keep_going:
+            return rc
+    # Loop exits only via /quit / EOF / shutdown.
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argparse parser."""
+    parser = argparse.ArgumentParser(
+        prog="python main.py",
+        description=(
+            "OMNIX V6 user runtime.  Defaults to an interactive text "
+            "REPL.  All work is delegated to OmnixEngine.process() "
+            "and the canonical V6 services."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python main.py                       # interactive REPL\n"
+            "  python main.py process hello         # one-shot request\n"
+            "  python main.py health                # engine health\n"
+            "  python main.py stats                 # engine statistics\n"
+            "  python main.py voice                 # one voice turn\n"
+            "  python main.py voice --turns 3       # three voice turns\n"
+            "  python main.py --llm-health          # LLM provider probe\n"
+            "  python main.py --debug process hi    # run with debug info\n"
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show correlation_id, status, duration, and detailed stats.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Force OMNIX_HEADLESS=1 (no physical UX).",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="Override OMNIX_LLM_PROVIDER for this run (mock|openrouter).",
+    )
+    parser.add_argument(
+        "--llm-health",
+        action="store_true",
+        help="Probe the configured LLM provider and exit (Phase 6D.1).",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="With --llm-health, skip the live HTTP probe (construct-only).",
+    )
+    parser.add_argument(
+        "--boot",
+        action="store_true",
+        help="Phase 15: print the readiness report, speak the "
+        "startup announcement (when ready), then exit.",
+    )
+    parser.add_argument(
+        "--no-speak",
+        action="store_true",
+        help="With --boot, skip TTS wiring and the spoken announcement.",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("health", help="Print engine + subsystem health and exit.")
+    sub.add_parser("stats", help="Print engine statistics and exit.")
+
+    p_proc = sub.add_parser(
+        "process",
+        help="Run one request through engine.process() and exit.",
+    )
+    p_proc.add_argument("text", help="The text to send to engine.process().")
+
+    p_voice = sub.add_parser(
+        "voice",
+        help="Run the voice loop (mic + engine + TTS) and exit.",
+    )
+    p_voice.add_argument(
+        "--turns",
+        type=int,
+        default=1,
+        help="How many voice turns to run (default 1).",
+    )
+    p_voice.add_argument(
+        "turns_positional",
+        nargs="?",
+        type=int,
+        default=None,
+        help="Optional positional turn count (legacy: `voice 3`).",
+    )
+
+    return parser
+
+
+def _legacy_argv_parse(argv: Sequence[str]) -> Tuple[
+    bool,
+    bool,
+    bool,
+    Optional[str],
+    bool,
+    bool,
+]:
+    """Backward-compat shim for the Phase 6D.1 _parse_argv contract.
+
+    Returns ``(help_flag, health_only, headless, provider_name,
+    llm_health_only, llm_offline)``.
+    """
+    help_flag = any(a in ("-h", "--help") for a in argv)
+    health_only = any(a == "--health" for a in argv)
+    headless = any(a == "--headless" for a in argv)
+    llm_health_only = any(
+        a == "--llm-health" or a.startswith("--llm-health") for a in argv
+    )
+    llm_offline = (
+        any(a == "--offline" for a in argv)
+        or os.getenv("OMNIX_LLM_DRY_RUN", "0").strip() == "1"
+    )
+    provider_name: Optional[str] = None
+    for a in argv:
+        if a.startswith("--provider="):
+            provider_name = a.split("=", 1)[1].strip() or None
+            break
+    return help_flag, health_only, headless, provider_name, llm_health_only, llm_offline
+
+
+# Public alias for tests that imported the legacy name.
+def _parse_argv(argv: List[str]):  # pragma: no cover
+    return _legacy_argv_parse(argv)
+
+
+# ---------------------------------------------------------------------------
+# run_cli (legacy entry point used by tests)
+# ---------------------------------------------------------------------------
+
+
+def run_cli(
+    base_dir: Optional[Path] = None,
+    *,
+    health_only: bool = False,
+    debug: bool = False,
+) -> int:
+    """Boot the engine and either dump health or enter the REPL.
+
+    This is the legacy entry point used by ``tests/test_main_llm_health.py``
+    and any external scripts.  It maps to the new ``main()`` dispatch.
+    """
+    if base_dir is None:
+        base_dir = Path.cwd()
+    _silence_third_party_noise()
+    try:
+        _, engine = build_engine(base_dir, quiet=False, headless=None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 1
+
+    print("===================================")
+    print("       OMNIX V6 IS READY           ")
+    print("===================================")
+    print_health(engine, debug=debug)
+
+    if health_only:
+        engine.stop()
+        return 0
+
+    try:
+        rc = run_repl(engine, debug=debug)
+    except KeyboardInterrupt:
+        print()
+        rc = 0
+    finally:
+        try:
+            engine.stop()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[shutdown] engine.stop() raised: {exc!r}", file=sys.stderr)
+        print("Omnix V6 engine stopped.  Goodbye.")
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# main() — the new top-level dispatch
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Top-level entry point.  Returns the process exit code."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Honour env-time gates so legacy callers (e.g. ``OMNIX_HEADLESS=1``)
+    # keep working.  These run BEFORE arg parsing because they are
+    # configuration, not command.
+    if "--headless" in argv or os.getenv("OMNIX_HEADLESS", "0").strip() == "1":
+        os.environ["OMNIX_HEADLESS"] = "1"
+
+    parser = build_parser()
+    args = parser.parse_args(list(argv))
+
+    debug = bool(getattr(args, "debug", False))
+    provider_override = getattr(args, "provider", None)
+    _prior_provider = os.environ.get("OMNIX_LLM_PROVIDER")
+    if provider_override:
+        canonical = (
+            "mock"
+            if provider_override.lower() in ("deterministic", "mock")
+            else provider_override
+        )
+        os.environ["OMNIX_LLM_PROVIDER"] = canonical
+
+    # Phase 6D.1: --llm-health is a no-CLI-loop fast path.
+    if getattr(args, "llm_health", False):
+        # The env override has already been applied above (provider_override
+        # is the canonical name).  We pass the original override through so
+        # any future alias handling has access to the user's spelling.
+        return run_llm_health_cli(
+            offline=bool(getattr(args, "offline", False)),
+            provider_override=provider_override,
+        )
+
+    # Phase 15: --boot prints the readiness report and (if every
+    # CRITICAL subsystem is READY) speaks the startup announcement.
+    if getattr(args, "boot", False):
+        headless = bool(
+            getattr(args, "headless", False)
+            or os.getenv("OMNIX_HEADLESS", "0").strip() == "1"
+        )
+        speak = not bool(getattr(args, "no_speak", False))
+        try:
+            _, engine = build_engine(Path.cwd(), quiet=False, headless=headless or None)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+            return 3
+        try:
+            return run_boot_cli(engine, headless=headless, quiet=False, speak=speak)
+        finally:
+            try:
+                engine.stop()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[shutdown] engine.stop() raised: {exc!r}", file=sys.stderr)
+
+    # Boot the engine once; every subcommand uses the same instance.
+    _silence_third_party_noise()
+    try:
+        _, engine = build_engine(Path.cwd(), quiet=True, headless=None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 3
+    try:
+        cmd = getattr(args, "command", None)
+        if cmd is None:
+            # Default: unified interactive loop (text + voice).  When
+            # the engine has no voice runtime this falls back to
+            # ``run_repl`` automatically.
+            return run_unified_interactive(engine, debug=debug)
+        if cmd == "health":
+            return run_health_cli(engine, debug=debug)
+        if cmd == "stats":
+            return run_stats_cli(engine, debug=debug)
+        if cmd == "process":
+            return run_process_cli(engine, args.text, debug=debug)
+        if cmd == "voice":
+            turns = (
+                getattr(args, "turns_positional", None)
+                if getattr(args, "turns_positional", None) is not None
+                else getattr(args, "turns", 1)
+            )
+            return run_voice_cli(engine, max_turns=int(turns), debug=debug)
+
+        # Unknown subcommand (should be impossible with argparse).
+        parser.print_help()
+        return 2
+    except KeyboardInterrupt:
+        print()
+        return 0
+    finally:
+        # Restore the prior provider env value so the CLI does not leak
+        # process-level state into the test suite (or the user's shell).
+        try:
+            if _prior_provider is None:
+                os.environ.pop("OMNIX_LLM_PROVIDER", None)
+            else:
+                os.environ["OMNIX_LLM_PROVIDER"] = _prior_provider
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            engine.stop()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[shutdown] engine.stop() raised: {exc!r}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+OMNIX V6 — User Runtime + Manual Test Interface (Phase 11.5).
+
+This module is a *thin front door* onto the canonical V6 architecture.
+It does NOT implement Brain logic, Agent logic, or any second execution
+pipeline.  All real work is delegated to the existing
+:class:`core.omnix_engine.OmnixEngine` and its services.
+
+Run with no arguments to start the normal Omnix user runtime:
+
+    python main.py
+
+Subcommands
+-----------
+
+    python main.py                      # normal voice-first interactive runtime
+    python main.py process "hello"      # run one request and print the result
+    python main.py health               # print engine + subsystem health
+    python main.py stats                # print engine statistics
+    python main.py voice                # one voice turn (mic + engine + TTS)
+    python main.py voice --turns N      # N voice turns
+    python main.py --llm-health         # probe the LLM provider
+    python main.py --help               # this help
+
+Normal startup behavior
+-----------------------
+
+    1. Boot the canonical OmnixEngine.
+    2. Evaluate the canonical readiness report.
+    3. When all CRITICAL subsystems are ready, connect SAPI TTS.
+    4. Speak: "Omnix is ready. How can I help you?"
+    5. Enter the unified voice + text runtime.
+
+TTS is best-effort: if audio is unavailable, Omnix remains usable in
+text mode and never claims that spoken output occurred.
+
+Interactive commands
+--------------------
+
+    /help       show this help inside the REPL
+    /health     engine + subsystem health snapshot
+    /stats      engine statistics
+    /process T  one-shot process of text T (debug aid)
+    /voice      one voice turn from inside the REPL
+    /clear      clear the screen
+    /quit       leave the REPL (also: /exit, /q)
+    Ctrl+C      same as /quit
+
+The CLI is intentionally minimal.  Every natural-language line typed
+in the REPL is forwarded directly to ``engine.process(text)``.  There
+is NO hard-coded command routing in this file.  See
+``docs/V6_PHASE_11_5_USER_RUNTIME_REPORT.md`` for the full contract.
+
+The CLI never imports: ``pyautogui``, ``subprocess``, ``win32gui``,
+``win32api``, BrowserService internals, Vision internals,
+:class:`MemoryStore`, or OpenRouterProvider internals.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
+
+from loguru import logger
+
+# ---------------------------------------------------------------------------
+# Public surface
+# ---------------------------------------------------------------------------
+
+# Re-exports kept for backward compatibility with Phase 6D.1 tests
+# (tests/test_main_llm_health.py) that import these by name.
+__all__ = [
+    "boot_engine",
+    "run_cli",
+    "build_engine",
+    "build_parser",
+    "main",
+    "print_health",
+    "print_stats",
+    "print_interactive_help",
+    "run_repl",
+    "run_unified_interactive",
+    "run_voice_cli",
+    "run_process_cli",
+    "run_health_cli",
+    "run_stats_cli",
+    "run_llm_health_cli",
+    "format_response",
+    "redact_secrets",
+    "prepare_interactive_runtime",
+    "_run_llm_health",  # legacy name; see alias below
+    "_parse_argv",  # legacy name; see alias below
+    "_build_engine",  # legacy name; see alias below
+]
+
+
+# ---------------------------------------------------------------------------
+# Boot the engine
+# ---------------------------------------------------------------------------
+
+
+def _silence_third_party_noise() -> None:
+    """R-18: silence noisy dependencies unless explicitly debugged."""
+    import warnings
+
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def build_engine(
+    base_dir: Optional[Path] = None,
+    *,
+    quiet: bool = True,
+    headless: Optional[bool] = None,
+) -> Tuple[Any, Any]:
+    """Load configuration, instantiate :class:`OmnixEngine`, boot it.
+
+    Returns ``(config, engine)``.  Raises on fatal boot failure.
+    This is the *only* place in the CLI that touches the engine.  The
+    rest of the runtime uses ``engine.process()`` /
+    ``engine.statistics()`` / ``engine.health`` exclusively.
+    """
+    from core.configuration import load, configure_logging
+    from core.omnix_engine import OmnixEngine
+
+    if base_dir is None:
+        base_dir = Path.cwd()
+    config = load(base_dir)
+    configure_logging(config)
+
+    if quiet:
+        logger.disable("core")
+
+    if not quiet:
+        logger.info("Initializing Omnix V6 Engine Sequence...")
+        if os.getenv("OMNIX_HEADLESS", "0").strip() == "1":
+            logger.info("Engine running in HEADLESS mode (no physical UX allowed)")
+
+    if headless is True:
+        os.environ["OMNIX_HEADLESS"] = "1"
+    elif headless is False:
+        os.environ.pop("OMNIX_HEADLESS", None)
+
+    engine = OmnixEngine(config)
+    if not engine.initialize():
+        raise RuntimeError("OmnixEngine.initialize() returned False")
+    engine.start()
+    return config, engine
+
+
+# Backward-compat alias for tests that imported the legacy name.
+def _build_engine(base_dir: Path, quiet: bool) -> Tuple[Any, Any]:  # pragma: no cover
+    return build_engine(base_dir, quiet=quiet)
+
+
+def boot_engine(
+    base_dir: Optional[Path] = None,
+    *,
+    headless: bool = False,
+    quiet: bool = False,
+) -> int:
+    """Initialize the engine and return without entering the CLI.
+
+    Returns 0 on clean shutdown, 1 on failure.  Kept for compatibility
+    with the Phase 1 boot path and headless CI smoke tests.
+    """
+    if base_dir is None:
+        base_dir = Path.cwd()
+    _silence_third_party_noise()
+    try:
+        _, engine = build_engine(base_dir, quiet=quiet, headless=headless or None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 1
+    if not quiet:
+        logger.info("===================================")
+        logger.info("       OMNIX AI IS READY           ")
+        logger.info("===================================")
+    print_health(engine, debug=False)
+    engine.stop()
+    return 0
+
+
+def _print_readiness_report(engine: Any) -> None:
+    """Print the engine's Phase 15 readiness report.  Honours the
+    canonical ``ReadinessReport.pretty()`` formatter when available
+    and falls back to a minimal one-line per-item summary."""
+    try:
+        report = engine.readiness_report()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[readiness] report unavailable: {exc!r}")
+        return
+    pretty = getattr(report, "pretty", None)
+    if callable(pretty):
+        try:
+            print(pretty())
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    items = getattr(report, "items", ()) or ()
+    is_ready = bool(getattr(report, "is_ready", False))
+    print("=" * 60)
+    print(f"OMNIX V6 READINESS  (is_ready={is_ready})")
+    print("=" * 60)
+    for item in items:
+        ready = "OK" if getattr(item, "ready", False) else "--"
+        cls = getattr(item, "classification", "?")
+        name = getattr(item, "name", "?")
+        detail = getattr(item, "detail", "")
+        dur = getattr(item, "duration_ms", 0.0) or 0.0
+        print(f"  [{ready:<2}] {cls:<10} {name:<24} {dur:6.1f}ms  {detail}")
+    print("=" * 60)
+
+
+def _connect_engine_tts(engine: Any) -> bool:
+    """Wire the engine-owned :class:`SpeechQueue` to the SAPI TTS
+    provider.  Returns ``True`` if the connection was made.  The
+    call is best-effort: any failure is logged and the engine
+    remains usable without TTS."""
+    try:
+        from voice.tts.sapi_provider import SAPITTSProvider
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"SAPI TTS provider unavailable: {exc!r}")
+        return False
+    try:
+        provider = SAPITTSProvider()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"SAPI TTS construction failed: {exc!r}")
+        return False
+    try:
+        ok = engine.connect_tts(provider)
+        if ok:
+            logger.info("SpeechQueue connected to SAPI TTS.")
+        return bool(ok)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"engine.connect_tts raised: {exc!r}")
+        return False
+
+
+def run_boot_cli(
+    engine: Any,
+    *,
+    headless: bool = False,
+    quiet: bool = False,
+    speak: bool = True,
+) -> int:
+    """Phase 15 ``--boot`` flow: print the readiness report, enqueue
+    the startup announcement (only if every critical subsystem is
+    READY), wait for the announcement to be spoken, then return
+    without entering the REPL.
+
+    ``speak=False`` skips the announcement and TTS wiring — useful
+    for headless CI tests.  ``headless=True`` is honoured by the
+    :func:`boot_engine` caller; here it only suppresses the TTS
+    wiring when ``speak`` is also ``False``.
+    """
+    _print_readiness_report(engine)
+    if not engine.readiness_report().is_ready:
+        if not quiet:
+            print(
+                "[boot] not all CRITICAL subsystems are READY; "
+                "skipping announcement."
+            )
+        return 2
+    if speak and not headless:
+        tts_ok = _connect_engine_tts(engine)
+        if tts_ok:
+            try:
+                engine.announce_ready()
+                # Wait briefly for the announcement to be spoken.
+                engine.wait_speech_idle(timeout_s=8.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"announce_ready raised: {exc!r}")
+    elif not speak:
+        if not quiet:
+            print("[boot] --no-speak: skipping announcement and TTS wiring.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Normal interactive runtime preparation
+# ---------------------------------------------------------------------------
+
+
+def prepare_interactive_runtime(
+    engine: Any,
+    *,
+    headless: bool = False,
+    speak: bool = True,
+    quiet: bool = False,
+) -> bool:
+    """Prepare the normal V6 user-facing runtime.
+
+    This is deliberately orchestration-only.  It does not implement
+    planning, computer use, browser automation, vision, or any other
+    capability.  Those responsibilities remain inside OmnixEngine and
+    the canonical V6 services.
+
+    Startup contract:
+
+      engine already booted
+          -> canonical readiness check
+          -> optional SAPI/TTS wiring
+          -> spoken ready announcement
+          -> caller enters the unified runtime
+
+    The readiness result is authoritative.  We never announce that Omnix
+    is ready when the engine's CRITICAL readiness report says otherwise.
+    TTS is best-effort so a microphone/speaker dependency cannot destroy
+    the text runtime.
+    """
+    try:
+        report = engine.readiness_report()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[readiness] unable to obtain readiness report: {exc!r}")
+        return False
+
+    is_ready = bool(getattr(report, "is_ready", False))
+
+    if not is_ready:
+        if not quiet:
+            print("[readiness] Omnix is not fully ready; startup speech skipped.")
+            _print_readiness_report(engine)
+        return False
+
+    if not speak or headless:
+        if not quiet and not headless and not speak:
+            print("[voice] startup speech disabled.")
+        return True
+
+    if not _connect_engine_tts(engine):
+        if not quiet:
+            print("[voice] TTS unavailable; continuing without startup speech.")
+        return True
+
+    try:
+        engine.announce_ready()
+        # The announcement is queued by the engine.  Wait only for the
+        # startup utterance to finish so the user never receives a prompt
+        # while the greeting is still speaking.
+        engine.wait_speech_idle(timeout_s=8.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Startup announcement failed; continuing: {exc!r}")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+# ---------------------------------------------------------------------------
+
+# Tokens we never want to see in CLI output, even by accident.
+# Any line containing one of these is replaced wholesale with a
+# fixed, safe message.  This is the LAST line of defence; the engine
+# itself never returns secrets.
+_SECRET_PATTERNS = (
+    "sk-",
+    "sk_live_",
+    "Bearer ",
+    "bearer ",
+    "api_key=",
+    "apikey=",
+    "password=",
+    "token=",
+    "OPENROUTER_API_KEY=",
+    "GROQ_API_KEY=",
+)
+
+
+def redact_secrets(text: str, *, replacement: str = "[REDACTED]") -> str:
+    """Replace any line that smells like a secret with a safe marker.
+
+    Phase 11.5 hardening: the CLI is the only place the user sees raw
+    strings, so it is the right place to do final redaction.  This is
+    intentionally permissive (any line containing a forbidden token is
+    redacted) — losing one line of harmless text is far better than
+    leaking a key.
+    """
+    if not isinstance(text, str):
+        return replacement
+    if not text:
+        return text
+    out_lines: List[str] = []
+    for raw in text.splitlines():
+        low = raw.lower()
+        if any(pat.lower() in low for pat in _SECRET_PATTERNS):
+            out_lines.append(replacement)
+        else:
+            out_lines.append(raw)
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+_BANNER = (
+    "=============================================================\n"
+    "                 OMNIX V6\n"
+    "       Voice-First AI Desktop Agent\n"
+    "============================================================="
+)
+
+
+def print_interactive_help() -> None:
+    """Print the REPL help text."""
+    print(
+        "Interactive commands:\n"
+        "  /help        show this help\n"
+        "  /health      engine + subsystem health snapshot\n"
+        "  /stats       engine statistics (request counts, capabilities, ...)\n"
+        "  /process T   run text T through engine.process() once (debug aid)\n"
+        "  /voice       one voice turn: listen -> process -> speak\n"
+        "  /clear       clear the screen\n"
+        "  /quit        leave the runtime  (also: /exit, /q, Ctrl+C)\n"
+        "\n"
+        "Any other line is treated as a natural-language request and\n"
+        "sent directly to engine.process().  The response text is\n"
+        "spoken via TTS when voice is enabled and printed otherwise."
+    )
+
+
+def print_health(engine: Any, *, debug: bool = False) -> None:
+    """Print a compact health snapshot.  Never includes secrets."""
+    try:
+        stats = engine.statistics()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[health] error collecting statistics: {exc!r}")
+        return
+
+    print("=" * 60)
+    print("OMNIX AI ENGINE HEALTH")
+    print("=" * 60)
+    print(f"  type           : {stats.get('type')}")
+    print(f"  lifecycle      : {stats.get('lifecycle')}")
+    print(f"  request_count  : {stats.get('request_count')}")
+    print(f"  executions     : {stats.get('execution_count')}")
+    print(f"  pipeline       : {stats.get('pipeline_available')}")
+    print(f"  capabilities   : {stats.get('capabilities_loaded')}")
+
+    services = stats.get("services", {}) or {}
+    counts = services.get("counts", {}) or {}
+    # The canonical :class:`ServiceRegistry.statistics()` returns the
+    # registered / initialised counts as top-level fields.  The richer
+    # ``health()`` shape nests them under ``counts``.  Honour both.
+    if counts:
+        registered = counts.get("registered", 0)
+        initialized = counts.get("initialized", 0)
+    else:
+        registered = services.get("registered", 0)
+        initialized = services.get("initialized", 0)
+    print(f"  service_state  : {services.get('lifecycle')}")
+    print(f"  services       : " f"{initialized}/{registered} initialized")
+
+    subsystems = (stats.get("health_report", {}) or {}).get("subsystems", {}) or {}
+    for name in ("pipeline", "brain", "agent", "llm_provider"):
+        sub = subsystems.get(name)
+        if sub is None:
+            continue
+        if isinstance(sub, dict):
+            # The canonical SubsystemHealth.to_dict() exposes
+            # ``status`` and ``lifecycle``.  Prefer those; fall back
+            # to whatever the subsystem chose to surface.
+            status = sub.get("status", "?")
+            lifecycle = sub.get("lifecycle", "")
+            if lifecycle and lifecycle not in ("unknown", ""):
+                line = f"{status} ({lifecycle})"
+            else:
+                line = str(status)
+        else:
+            line = "?"
+        print(f"  subsystem:{name:<13}: {line}")
+
+    if debug:
+        # Debug: also include the memory statistics and the LLM
+        # provider's statistics().  Never include the API key.
+        mem = stats.get("memory")
+        if isinstance(mem, dict):
+            print(f"  memory         : {mem.get('type', '?')}")
+            for k, v in mem.items():
+                if k == "type":
+                    continue
+                print(f"    {k:<13}: {v}")
+        llm = subsystems.get("llm_provider") if isinstance(subsystems, dict) else None
+        if isinstance(llm, dict):
+            llm_stats = llm.get("statistics") or llm.get("stats") or {}
+            if isinstance(llm_stats, dict):
+                print(f"  llm.model      : {llm_stats.get('model', '')}")
+                print(f"  llm.calls      : {llm_stats.get('call_count', 0)}")
+                print(f"  llm.errors     : {llm_stats.get('error_count', 0)}")
+    print("=" * 60)
+
+
+def print_stats(engine: Any, *, debug: bool = False) -> None:
+    """Print engine statistics()."""
+    try:
+        stats = engine.statistics()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[stats] error collecting statistics: {exc!r}")
+        return
+    safe = json.dumps(stats, indent=2, default=str)
+    print(redact_secrets(safe))
+
+
+def format_response(response: Any, *, debug: bool = False) -> str:
+    """Render an :class:`OmnixResponse` for the CLI.
+
+    In normal mode: print only the user-facing ``text`` field.
+    In debug mode: also include ``status``, ``duration_ms``, and
+    ``correlation_id`` (the latter is shown only when debug is on).
+    """
+    if response is None:
+        return "(no response)"
+    text = getattr(response, "text", "") or ""
+    if debug:
+        cid = getattr(response, "correlation_id", "") or ""
+        status = getattr(response, "status", None)
+        status_str = status.value if hasattr(status, "value") else str(status)
+        dur = getattr(response, "duration_ms", 0.0) or 0.0
+        head = f"[{status_str} | {dur:.0f}ms | cid={cid}]"
+        text = f"{head}\n{text}"
+    return redact_secrets(text)
+
+
+# ---------------------------------------------------------------------------
+# Voice subcommand
+# ---------------------------------------------------------------------------
+
+
+def _make_voice_service(engine: Any) -> Any:
+    """Build the canonical :class:`VoiceService` for the CLI.
+
+    Voice is OPTIONAL.  If the module is not importable in this
+    environment (e.g. faster-whisper is missing) we return ``None``
+    and the caller degrades gracefully.
+    """
+    try:
+        from voice.service import VoiceService
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"VoiceService import failed: {exc!r}")
+        return None
+    try:
+        return VoiceService(engine=engine)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"VoiceService construction failed: {exc!r}")
+        return None
+
+
+def run_voice_cli(
+    engine: Any,
+    *,
+    max_turns: int = 1,
+    debug: bool = False,
+) -> int:
+    """Run the voice loop for ``max_turns`` turns.  Returns 0 on success."""
+    if max_turns <= 0:
+        print("[voice] no turns requested")
+        return 0
+    svc = _make_voice_service(engine)
+    if svc is None:
+        print(
+            "[voice] VoiceService is not available in this environment; "
+            "the voice subsystem is OPTIONAL."
+        )
+        return 0
+    # Phase 15: hand the engine-owned SpeechQueue to the voice
+    # service so real-time progress narration and the result
+    # utterance flow through the SAME ordered, deduplicated queue
+    # instead of being spoken inline.  Wire the SAPI TTS to the
+    # engine's queue worker so anything the queue dequeues is
+    # actually rendered as audio.
+    try:
+        if getattr(engine, "speech_queue", None) is not None:
+            try:
+                svc._speech_queue = engine.speech_queue
+            except Exception:  # noqa: BLE001
+                pass
+            _connect_engine_tts(engine)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        svc.initialize()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] initialize() failed: {exc!r}")
+        return 0
+    try:
+        print(f"[voice] running {max_turns} voice turn(s); speak when prompted.")
+        completed = svc.run_voice_loop(max_turns=max_turns)
+        print(f"[voice] {completed}/{max_turns} turn(s) completed successfully.")
+        return 0
+    except KeyboardInterrupt:
+        print("\n[voice] interrupted.")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] voice loop failed: {exc!r}")
+        return 0
+    finally:
+        try:
+            svc.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
+# One-shot process / health / stats subcommands
+# ---------------------------------------------------------------------------
+
+
+def run_process_cli(
+    engine: Any,
+    text: str,
+    *,
+    debug: bool = False,
+) -> int:
+    """Run ``engine.process(text)`` once and print the result."""
+    if not text or not str(text).strip():
+        print("[error] empty input; provide a non-empty text argument.")
+        return 2
+    try:
+        response = engine.process(text)
+    except KeyboardInterrupt:
+        print("[process] interrupted.")
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] engine.process() raised: {exc!r}")
+        return 1
+    print(format_response(response, debug=debug))
+    err = getattr(response, "error", None)
+    status = getattr(response, "status", None)
+    if status is not None and hasattr(status, "value"):
+        sval = status.value
+        if sval in ("failed", "timeout", "cancelled", "rejected") and err:
+            return 1
+    return 0
+
+
+def run_health_cli(engine: Any, *, debug: bool = False) -> int:
+    print_health(engine, debug=debug)
+    return 0
+
+
+def run_stats_cli(engine: Any, *, debug: bool = False) -> int:
+    print_stats(engine, debug=debug)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# LLM health probe (Phase 6D.1 — kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+
+def run_llm_health_cli(
+    *,
+    offline: bool = False,
+    provider_override: Optional[str] = None,
+) -> int:
+    """Phase 6D.1: probe the configured LLM provider and exit.
+
+    Exit codes: 0 = ok (or skipped in offline/mock mode), 2 = probe
+    failure, 3 = config error.  No key value is ever printed.
+    """
+    _silence_third_party_noise()
+    try:
+        config, engine = build_engine(Path.cwd(), quiet=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 3
+    # Snapshot the prior env value so the override we apply below is
+    # restored exactly when we leave -- this CLI must not leak process-
+    # level state into the test suite (or the user's shell).
+    _prior_provider = os.environ.get("OMNIX_LLM_PROVIDER")
+    try:
+        if provider_override:
+            # ``deterministic`` is the dev alias for the mock provider.
+            canonical = (
+                "mock"
+                if provider_override.lower() in ("deterministic", "mock")
+                else provider_override
+            )
+            os.environ["OMNIX_LLM_PROVIDER"] = canonical
+        return _run_llm_health(config, engine, offline=offline)
+    finally:
+        # Restore the prior env value (or remove the key entirely if it
+        # wasn't set before).  Failing to do this leaked a process-level
+        # ``OMNIX_LLM_PROVIDER=mock`` into the test suite and broke
+        # any later test that resolved a provider by config alone.
+        try:
+            if _prior_provider is None:
+                os.environ.pop("OMNIX_LLM_PROVIDER", None)
+            else:
+                os.environ["OMNIX_LLM_PROVIDER"] = _prior_provider
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            engine.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_llm_health(
+    config: Any,
+    engine: Any,
+    *,
+    offline: bool = False,
+) -> int:
+    """Probe the configured LLM provider and print a structured report.
+
+    This command closes the loop between "provider constructs" (proved
+    by ``--health``) and "the LLM actually answers" (today only provable
+    in mocked-HTTP tests).  In offline mode (or when the provider is
+    the deterministic :class:`MockProvider`) the command performs no
+    network call and exits 0 once construction succeeds.
+
+    Exit codes:
+
+        0 — provider constructed (and probe succeeded if not offline)
+        2 — provider error during probe (auth, rate limit, timeout, …)
+        3 — configuration error (missing key, unknown model, …)
+
+    No key value is ever printed; only the key *count* and the
+    provider's identity are surfaced.
+    """
+    from ai.provider import (
+        MockProvider,
+        get_provider,
+        LLMRequest,
+        LLMMessage,
+        MessageRole,
+        OutputFormat,
+    )
+    from ai.provider.errors import (
+        ConfigurationError_ as ProviderConfigurationError,
+        ProviderError,
+    )
+
+    print("=" * 60)
+    print("OMNIX V6 LLM HEALTH PROBE")
+    print("=" * 60)
+
+    # 1) Construct the provider.  A ConfigurationError_ here is a
+    #    config issue (exit 3); anything else is a probe failure (2).
+    try:
+        provider = get_provider(config)
+    except ProviderConfigurationError as exc:
+        print(f"  llm_provider   : ERROR: {exc}")
+        print(f"  code           : {getattr(exc, 'code', 'PROVIDER_CONFIG_INVALID')}")
+        print("=" * 60)
+        return 3
+    except Exception as exc:  # noqa: BLE001
+        print(f"  llm_provider   : ERROR: {exc!r}")
+        print("=" * 60)
+        return 3
+
+    provider_name = getattr(provider, "name", type(provider).__name__)
+    model = getattr(provider, "_model", None)
+    key_count = len(getattr(config, "openrouter_keys", ()) or ())
+    base_url = getattr(config, "openrouter_url", "")
+
+    print(f"  llm_provider   : {provider_name}")
+    if model:
+        print(f"  model          : {model}")
+    if key_count:
+        # R-12: never print the key value, only the count.
+        print(f"  api_key_count  : {key_count}")
+    if base_url:
+        print(f"  base_url       : {base_url}")
+
+    is_mock = isinstance(provider, MockProvider)
+
+    # 2) Offline mode: construct-only probe.  Exit 0 immediately.
+    if offline or is_mock:
+        if is_mock:
+            print("  probe          : SKIPPED (MockProvider is offline by design)")
+        else:
+            print("  probe          : SKIPPED (--offline / OMNIX_LLM_DRY_RUN=1)")
+        print("  status         : OK (provider constructed)")
+        print("=" * 60)
+        return 0
+
+    # 3) Live probe: one minimal completion call.  Bounded by
+    #    request-level timeout; provider-level retries still apply.
+    request = LLMRequest(
+        messages=[LLMMessage(role=MessageRole.USER, content="ping")],
+        output_format=OutputFormat.TEXT,
+        max_tokens=8,
+        timeout_s=15.0,
+    )
+    started = time.time()
+    try:
+        response = provider.generate(request)
+    except ProviderError as exc:
+        elapsed = time.time() - started
+        print(f"  probe          : FAILED ({elapsed:.2f}s)")
+        print(f"  code           : {getattr(exc, 'code', 'PROVIDER_ERROR')}")
+        # NEVER print exc.args verbatim — it may carry the bearer key
+        # in a misbehaving upstream.  Use the provider's redacted message.
+        print(f"  message        : {getattr(exc, 'message', str(exc))}")
+        print("=" * 60)
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        elapsed = time.time() - started
+        print(f"  probe          : FAILED ({elapsed:.2f}s)")
+        print(f"  error          : {type(exc).__name__}: {exc}")
+        print("=" * 60)
+        return 2
+
+    elapsed = time.time() - started
+    usage = getattr(response, "usage", None)
+    pt = getattr(usage, "prompt_tokens", None) if usage else None
+    ct = getattr(usage, "completion_tokens", None) if usage else None
+    tt = getattr(usage, "total_tokens", None) if usage else None
+    print(f"  probe          : OK ({elapsed:.2f}s)")
+    print(f"  finish_reason  : {getattr(response, 'finish_reason', None)}")
+    if pt is not None or ct is not None or tt is not None:
+        print(f"  tokens         : prompt={pt} completion={ct} total={tt}")
+    print("=" * 60)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Interactive REPL
+# ---------------------------------------------------------------------------
+
+
+def _read_line(prompt: str) -> Optional[str]:
+    """Read one line from stdin, or return ``None`` on EOF.
+
+    Ctrl+C at the prompt returns ``"exit"`` so the caller can shut
+    down cleanly.
+    """
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+    except KeyboardInterrupt:
+        print()
+        return "exit"
+
+
+def _handle_interactive_line(
+    engine: Any,
+    raw: str,
+    *,
+    debug: bool = False,
+) -> Tuple[bool, int]:
+    """Process one line of REPL input.
+
+    Returns ``(keep_going, exit_code)``:
+      * ``keep_going=False`` means the REPL should exit (e.g. ``/quit``).
+      * ``exit_code`` is the process exit code the REPL should use.
+    """
+    line = (raw or "").strip()
+    if not line:
+        return True, 0
+
+    if line in ("/quit", "/exit", "/q", "exit", "quit", "q"):
+        return False, 0
+    if line in ("/help", "help", "?"):
+        print_interactive_help()
+        return True, 0
+    if line == "/health":
+        print_health(engine, debug=debug)
+        return True, 0
+    if line == "/stats":
+        print_stats(engine, debug=debug)
+        return True, 0
+    if line == "/clear":
+        # ANSI clear; harmless on platforms that ignore it.
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        return True, 0
+    if line == "/voice":
+        run_voice_cli(engine, max_turns=1, debug=debug)
+        return True, 0
+    if line.startswith("/process "):
+        _, _, rest = line.partition(" ")
+        run_process_cli(engine, rest.strip(), debug=debug)
+        return True, 0
+    if line.startswith("/"):
+        print(f"[error] unknown command: {line!r}")
+        print("  type /help for the list of commands.")
+        return True, 0
+
+    # Anything else: natural language.  Hand it to engine.process().
+    # We never branch on the text content (no hard-coded automation).
+    try:
+        response = engine.process(line)
+    except KeyboardInterrupt:
+        print("[process] interrupted.")
+        return True, 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] engine.process() raised: {exc!r}")
+        return True, 0
+    print(format_response(response, debug=debug))
+    return True, 0
+
+
+def run_repl(engine: Any, *, debug: bool = False) -> int:
+    """The interactive text REPL.
+
+    Reads lines from stdin and dispatches them.  Any non-command line
+    is forwarded to ``engine.process()``.  The REPL never crashes on
+    a single bad line; it logs and keeps going.
+
+    Phase 4: a SIGINT handler is installed for the lifetime of each
+    command.  When the user hits Ctrl+C, the handler flips the
+    in-flight ``CancellationToken`` via
+    ``engine.request_cancel_all`` so the Agent loop finalises
+    early with state ``CANCELLED`` instead of being killed.
+    """
+    print(_BANNER)
+    while True:
+        raw = _read_line("You: ")
+        if raw is None:
+            # EOF
+            print()
+            break
+        # Install SIGINT-cancels-in-flight-request handler for the
+        # duration of this command.  We restore the previous
+        # handler afterwards so Ctrl+C still exits the REPL when
+        # no command is running.
+        prev_handler = None
+        try:
+            import signal as _signal
+
+            def _sigint_cancel(_signum, _frame):  # noqa: ANN001
+                try:
+                    engine.request_cancel_all(reason="cancelled by SIGINT")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            prev_handler = _signal.getsignal(_signal.SIGINT)
+            try:
+                _signal.signal(_signal.SIGINT, _sigint_cancel)
+            except (ValueError, OSError):
+                # Signal handlers can only be installed from the
+                # main thread on some platforms — fall back to
+                # KeyboardInterrupt flow.
+                prev_handler = None
+        except Exception:  # noqa: BLE001
+            prev_handler = None
+        try:
+            keep_going, rc = _handle_interactive_line(
+                engine,
+                raw,
+                debug=debug,
+            )
+        except KeyboardInterrupt:
+            print("[cancelled]")
+            keep_going, rc = True, 0
+        except Exception as exc:  # noqa: BLE001
+            # The REPL must never crash on a single line.
+            print(f"[error] {exc!r}")
+            keep_going, rc = True, 0
+        finally:
+            if prev_handler is not None:
+                try:
+                    import signal as _signal
+
+                    _signal.signal(_signal.SIGINT, prev_handler)
+                except Exception:  # noqa: BLE001
+                    pass
+        if not keep_going:
+            return rc
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Unified interactive loop (Part 3) — text REPL with parallel voice
+# ---------------------------------------------------------------------------
+
+
+def _has_voice_runtime(engine: Any) -> bool:
+    """True if the engine has a wired :class:`VoiceRuntime`."""
+    return bool(getattr(engine, "voice_runtime", None))
+
+
+def _is_voice_sleeping(engine: Any) -> bool:
+    """True if the runtime controller is currently asleep / waking."""
+    rt = getattr(engine, "voice_runtime", None)
+    if rt is None:
+        return False
+    try:
+        return bool(getattr(rt.controller, "is_asleep", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wake_engine_voice(engine: Any) -> None:
+    """Transition the runtime from SLEEPING → READY."""
+    rt = getattr(engine, "voice_runtime", None)
+    if rt is None:
+        return
+    try:
+        rt.wake()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"voice_runtime.wake() raised: {exc!r}")
+
+
+def run_unified_interactive(engine: Any, *, debug: bool = False) -> int:
+    """Unified text + voice interactive loop.
+
+    When the engine has a wired :class:`VoiceRuntime`, the
+    wake-word listener and command STT run in the background; the
+    text REPL handles typed input.  Either path can call
+    :meth:`OmnixEngine.request_shutdown` to exit.  When the engine
+    has no voice runtime we fall back to the plain :func:`run_repl`.
+    """
+    if not _has_voice_runtime(engine):
+        return run_repl(engine, debug=debug)
+    print(_BANNER)
+    print(
+        "[voice] Unified runtime active. Say the wake phrase to issue a "
+        "voice command, or type below.  Use /quit to leave."
+    )
+    while True:
+        # Cooperative shutdown: the voice path calls
+        # ``request_shutdown`` when it hears /quit, and the text path
+        # does the same through ``_handle_interactive_line``.
+        if bool(getattr(engine, "_shutdown_requested", False)):
+            print()
+            print("[voice] Shutdown requested. Goodbye.")
+            return 0
+        prompt = (
+            "You (sleeping — say the wake phrase): "
+            if _is_voice_sleeping(engine)
+            else "You: "
+        )
+        raw = _read_line(prompt)
+        if raw is None:
+            print()
+            return 0
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # If the user types ``/wake`` while asleep, transition the
+        # runtime to READY and resume normal prompt.
+        if _is_voice_sleeping(engine) and stripped.lower() in (
+            "/wake",
+            "wake",
+            "i'm back",
+        ):
+            _wake_engine_voice(engine)
+            print("[voice] Awake. Listening for your command.")
+            continue
+        try:
+            keep_going, rc = _handle_interactive_line(
+                engine,
+                raw,
+                debug=debug,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The REPL must never crash on a single line.
+            print(f"[error] {exc!r}")
+            continue
+        if not keep_going:
+            return rc
+    # Loop exits only via /quit / EOF / shutdown.
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argparse parser."""
+    parser = argparse.ArgumentParser(
+        prog="python main.py",
+        description=(
+            "OMNIX V6 voice-first user runtime.  Defaults to the unified "
+            "voice + text runtime.  All work is delegated to OmnixEngine.process() "
+            "and the canonical V6 services."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python main.py                       # interactive REPL\n"
+            "  python main.py process hello         # one-shot request\n"
+            "  python main.py health                # engine health\n"
+            "  python main.py stats                 # engine statistics\n"
+            "  python main.py voice                 # one voice turn\n"
+            "  python main.py voice --turns 3       # three voice turns\n"
+            "  python main.py --llm-health          # LLM provider probe\n"
+            "  python main.py --debug process hi    # run with debug info\n"
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show correlation_id, status, duration, and detailed stats.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Force OMNIX_HEADLESS=1 (no physical UX).",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="Override OMNIX_LLM_PROVIDER for this run (mock|openrouter).",
+    )
+    parser.add_argument(
+        "--llm-health",
+        action="store_true",
+        help="Probe the configured LLM provider and exit (Phase 6D.1).",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="With --llm-health, skip the live HTTP probe (construct-only).",
+    )
+    parser.add_argument(
+        "--boot",
+        action="store_true",
+        help="Print readiness, speak the startup announcement (when ready), then exit.",
+    )
+    parser.add_argument(
+        "--no-speak",
+        action="store_true",
+        help="Skip startup TTS/announcement for this run (also applies to normal startup).",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("health", help="Print engine + subsystem health and exit.")
+    sub.add_parser("stats", help="Print engine statistics and exit.")
+
+    p_proc = sub.add_parser(
+        "process",
+        help="Run one request through engine.process() and exit.",
+    )
+    p_proc.add_argument("text", help="The text to send to engine.process().")
+
+    p_voice = sub.add_parser(
+        "voice",
+        help="Run the voice loop (mic + engine + TTS) and exit.",
+    )
+    p_voice.add_argument(
+        "--turns",
+        type=int,
+        default=1,
+        help="How many voice turns to run (default 1).",
+    )
+    p_voice.add_argument(
+        "turns_positional",
+        nargs="?",
+        type=int,
+        default=None,
+        help="Optional positional turn count (legacy: `voice 3`).",
+    )
+
+    return parser
+
+
+def _legacy_argv_parse(argv: Sequence[str]) -> Tuple[
+    bool,
+    bool,
+    bool,
+    Optional[str],
+    bool,
+    bool,
+]:
+    """Backward-compat shim for the Phase 6D.1 _parse_argv contract.
+
+    Returns ``(help_flag, health_only, headless, provider_name,
+    llm_health_only, llm_offline)``.
+    """
+    help_flag = any(a in ("-h", "--help") for a in argv)
+    health_only = any(a == "--health" for a in argv)
+    headless = any(a == "--headless" for a in argv)
+    llm_health_only = any(
+        a == "--llm-health" or a.startswith("--llm-health") for a in argv
+    )
+    llm_offline = (
+        any(a == "--offline" for a in argv)
+        or os.getenv("OMNIX_LLM_DRY_RUN", "0").strip() == "1"
+    )
+    provider_name: Optional[str] = None
+    for a in argv:
+        if a.startswith("--provider="):
+            provider_name = a.split("=", 1)[1].strip() or None
+            break
+    return help_flag, health_only, headless, provider_name, llm_health_only, llm_offline
+
+
+# Public alias for tests that imported the legacy name.
+def _parse_argv(argv: List[str]):  # pragma: no cover
+    return _legacy_argv_parse(argv)
+
+
+# ---------------------------------------------------------------------------
+# run_cli (legacy entry point used by tests)
+# ---------------------------------------------------------------------------
+
+
+def run_cli(
+    base_dir: Optional[Path] = None,
+    *,
+    health_only: bool = False,
+    debug: bool = False,
+) -> int:
+    """Boot the engine and either dump health or enter the REPL.
+
+    This is the legacy entry point used by ``tests/test_main_llm_health.py``
+    and any external scripts.  It maps to the new ``main()`` dispatch.
+    """
+    if base_dir is None:
+        base_dir = Path.cwd()
+    _silence_third_party_noise()
+    try:
+        _, engine = build_engine(base_dir, quiet=False, headless=None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 1
+
+    print("===================================")
+    print("       OMNIX V6 IS READY           ")
+    print("===================================")
+    print_health(engine, debug=debug)
+
+    if health_only:
+        engine.stop()
+        return 0
+
+    try:
+        rc = run_repl(engine, debug=debug)
+    except KeyboardInterrupt:
+        print()
+        rc = 0
+    finally:
+        try:
+            engine.stop()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[shutdown] engine.stop() raised: {exc!r}", file=sys.stderr)
+        print("Omnix V6 engine stopped.  Goodbye.")
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# main() — the new top-level dispatch
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Top-level entry point.  Returns the process exit code."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Honour env-time gates so legacy callers (e.g. ``OMNIX_HEADLESS=1``)
+    # keep working.  These run BEFORE arg parsing because they are
+    # configuration, not command.
+    if "--headless" in argv or os.getenv("OMNIX_HEADLESS", "0").strip() == "1":
+        os.environ["OMNIX_HEADLESS"] = "1"
+
+    parser = build_parser()
+    args = parser.parse_args(list(argv))
+
+    debug = bool(getattr(args, "debug", False))
+    provider_override = getattr(args, "provider", None)
+    _prior_provider = os.environ.get("OMNIX_LLM_PROVIDER")
+    if provider_override:
+        canonical = (
+            "mock"
+            if provider_override.lower() in ("deterministic", "mock")
+            else provider_override
+        )
+        os.environ["OMNIX_LLM_PROVIDER"] = canonical
+
+    # Phase 6D.1: --llm-health is a no-CLI-loop fast path.
+    if getattr(args, "llm_health", False):
+        # The env override has already been applied above (provider_override
+        # is the canonical name).  We pass the original override through so
+        # any future alias handling has access to the user's spelling.
+        return run_llm_health_cli(
+            offline=bool(getattr(args, "offline", False)),
+            provider_override=provider_override,
+        )
+
+    # Phase 15: --boot prints the readiness report and (if every
+    # CRITICAL subsystem is READY) speaks the startup announcement.
+    if getattr(args, "boot", False):
+        headless = bool(
+            getattr(args, "headless", False)
+            or os.getenv("OMNIX_HEADLESS", "0").strip() == "1"
+        )
+        speak = not bool(getattr(args, "no_speak", False))
+        try:
+            _, engine = build_engine(Path.cwd(), quiet=False, headless=headless or None)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+            return 3
+        try:
+            return run_boot_cli(engine, headless=headless, quiet=False, speak=speak)
+        finally:
+            try:
+                engine.stop()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[shutdown] engine.stop() raised: {exc!r}", file=sys.stderr)
+
+    # Boot the engine once; every subcommand uses the same instance.
+    _silence_third_party_noise()
+    try:
+        _, engine = build_engine(Path.cwd(), quiet=True, headless=None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: Could not boot engine: {exc!r}", file=sys.stderr)
+        return 3
+    try:
+        cmd = getattr(args, "command", None)
+        if cmd is None:
+            # Normal V6 user startup.  This is the product-facing path:
+            # readiness -> optional TTS wiring -> spoken ready greeting
+            # -> unified voice/text interaction.  The greeting is never
+            # emitted unless the canonical readiness report says the
+            # critical runtime is ready.
+            headless = bool(
+                getattr(args, "headless", False)
+                or os.getenv("OMNIX_HEADLESS", "0").strip() == "1"
+            )
+            speak = not bool(getattr(args, "no_speak", False))
+            prepare_interactive_runtime(
+                engine,
+                headless=headless,
+                speak=speak,
+                quiet=False,
+            )
+            return run_unified_interactive(engine, debug=debug)
+        if cmd == "health":
+            return run_health_cli(engine, debug=debug)
+        if cmd == "stats":
+            return run_stats_cli(engine, debug=debug)
+        if cmd == "process":
+            return run_process_cli(engine, args.text, debug=debug)
+        if cmd == "voice":
+            turns = (
+                getattr(args, "turns_positional", None)
+                if getattr(args, "turns_positional", None) is not None
+                else getattr(args, "turns", 1)
+            )
+            return run_voice_cli(engine, max_turns=int(turns), debug=debug)
+
+        # Unknown subcommand (should be impossible with argparse).
+        parser.print_help()
+        return 2
+    except KeyboardInterrupt:
+        print()
+        return 0
+    finally:
+        # Restore the prior provider env value so the CLI does not leak
+        # process-level state into the test suite (or the user's shell).
+        try:
+            if _prior_provider is None:
+                os.environ.pop("OMNIX_LLM_PROVIDER", None)
+            else:
+                os.environ["OMNIX_LLM_PROVIDER"] = _prior_provider
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            engine.stop()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[shutdown] engine.stop() raised: {exc!r}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

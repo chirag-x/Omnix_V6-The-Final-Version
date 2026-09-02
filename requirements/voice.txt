@@ -1,0 +1,21 @@
+# Omnix V6 — Voice Foundation
+# Phase 2 (Wake word + STT + TTS)
+# Models are lazy-loaded; this file installs only the runtime libraries.
+#   faster-whisper models: ~/.cache/huggingface/ on first use.
+#   openwakeword models:   ~/.cache/openwakeword/ on first use.
+
+# --- STT ---
+faster-whisper==1.2.1
+SpeechRecognition==3.14.5
+
+# --- TTS ---
+edge-tts==7.2.7
+pygame==2.6.1
+
+# --- Wake word ---
+openwakeword==0.6.0
+
+# --- Audio I/O ---
+sounddevice==0.5.5
+mss==10.1.0
+numpy==2.4.2

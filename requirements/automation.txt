@@ -1,0 +1,12 @@
+# Omnix V6 — Windows Automation / Input Foundation
+# Phase 3 (Desktop control surface)
+# Layered: native Win32 (pywin32) > UIA (comtypes) > input simulation (PyAutoGUI, keyboard, mouse).
+
+# --- Native input simulation ---
+PyAutoGUI==0.9.54
+keyboard==0.13.5
+mouse==0.7.1
+
+# --- Native Win32 / COM (already in base.txt, but repeated for clarity) ---
+pywin32==311
+comtypes==1.4.16

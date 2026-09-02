@@ -1,0 +1,19 @@
+# Omnix V6 — Vision Foundation
+# Phase 1+ (PerceptionRouter + YOLO + OCR)
+# Adaptive routing: UIA > DOM > OCR > Vision > Coordinates (per PerceptionRouter policy).
+# YOLO weights: vision/models/yolo11n.pt (5.6 MB, present on disk).
+# OCR models: lazy-load from ~/.EasyOCR/model/ on first OCR use.
+
+# --- Ultralytics (YOLO 11) ---
+ultralytics==8.4.21
+ultralytics-thop==2.0.18
+
+# --- OpenCV (NON-headless; V6 needs GUI cv2.imshow for debug, but the perception
+#     pipeline uses headless-style frame arrays. We install the full opencv-python
+#     to get imshow; the pipeline never calls imshow in production. ---
+opencv-python==4.13.0.92
+
+# --- OCR (easyocr) ---
+easyocr==1.7.2
+
+pywinauto
