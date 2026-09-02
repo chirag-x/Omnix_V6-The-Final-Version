@@ -90,6 +90,8 @@ class ExecutionResult:
     precondition_results: tuple = field(default_factory=tuple)  # Precondition check results
     # Stage 19.3: Synchronization result
     synchronization_result: Optional[Any] = None  # SynchronizationResult from SYNCHRONIZE
+    # NEW: Recovery result
+    recovery_result: Optional[Any] = None   # RecoveryResult from RECOVERY
     started_at: float = 0.0
     completed_at: float = 0.0
     duration_ms: float = 0.0
