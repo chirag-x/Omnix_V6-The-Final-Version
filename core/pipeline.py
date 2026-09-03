@@ -412,8 +412,9 @@ class RequestPipeline:
                 agent_result = self.agent.run_goal(
                     goal, intent=intent_obj
                 )
-        except Exception:
-            return self._fail(cid, t0, error="agent run raised")
+        except Exception as e:
+            logger.exception("Agent run raised an exception")
+            return self._fail(cid, t0, error=f"agent run raised: {e}")
 
         if agent_result is None:
             return self._fail(cid, t0, error="agent returned no result")

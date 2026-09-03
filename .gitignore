@@ -36,3 +36,7 @@ build/
 *.pt
 *.pth
 *.onnx
+
+# Ignore test and script directories
+tests/
+scripts/

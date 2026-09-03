@@ -1,153 +1,57 @@
-import asyncio
-from unittest.mock import Mock
-from core.execution import ExecutionCycle, ExecutionStep, StepAction, VerificationExpectation
-from core.execution.provider import DefaultActionExecutor, DefaultGroundingProvider, DefaultVerificationProvider
-from core.capability_router import CapabilityRouter
-from core.capability_registry import CapabilityRegistry
-from vision.perception_adapter import PerceptionAdapter
-from vision.router.perception_router import PerceptionRouter
-from vision.router.screenshot_provider import ScreenshotProvider
-from core.capabilities import MouseClickCapability, KeyboardTypeCapability
-from core.orchestration.cancellation import CancellationToken
-from core.grounding.target_resolver import TargetResolver
-from core.results import CapabilityResult, CapabilityStatus
+# Exact copy of the test function
+from core.task.models import (
+    Task,
+    TaskPlan,
+    TaskStep,
+    TaskStatus,
+    TaskKind,
+    TaskResult,
+    TaskFailure,
+    create_task,
+    create_task_step,
+    create_task_plan
+)
 
+def test_task_plan_has_circular_dependency():
+    """Test TaskPlan.has_circular_dependency method"""
+    # No circular dependency
+    step1 = create_task_step(0, "Step 1", "Intent 1", "cap1", dependencies=frozenset())
+    step2 = create_task_step(1, "Step 2", "Intent 2", "cap2", dependencies=frozenset([step1.step_id]))
+    plan1 = create_task_plan("Test goal", (step1, step2))
+    assert plan1.has_circular_dependency() == False
 
-class MockPerceptionRouter:
-    def __init__(self, return_candidates=None):
-        self._candidates = return_candidates or []
-        self.call_count = 0
+    # Circular dependency: 1 -> 2 -> 3 -> 4 -> 1
+    # To create this, we need:
+    # Step 1 depends on Step 4
+    # Step 2 depends on Step 1
+    # Step 3 depends on Step 2
+    # Step 4 depends on Step 3
 
-    def find_targets(self, target_query="*", image_path=None):
-        self.call_count += 1
-        from vision.observations.targets import TargetCandidate
-        from core.orchestration.models import ObservationSource
+    # Create steps in reverse order so we can reference the correct IDs
+    # We'll create them all first to get their IDs, then recreate with proper deps
 
-        # Return a mock button candidate
-        candidate = TargetCandidate(
-            text="Test Button",
-            bbox=(100, 100, 200, 150),
-            confidence=0.95,
-            source_type=ObservationSource.UIA,
-            properties={
-                "name": "Test Button",
-                "automation_id": "testButton",
-                "control_type": "Button"
-            }
-        )
-        return [candidate]
+    # First pass: create steps to get their IDs for the circular dependency
+    temp_step1 = create_task_step(0, "Step 1", "Intent 1", "cap1")
+    temp_step2 = create_task_step(1, "Step 2", "Intent 2", "cap2")
+    temp_step3 = create_task_step(2, "Step 3", "Intent 3", "cap3")
+    temp_step4 = create_task_step(3, "Step 4", "Intent 4", "cap4")
 
+    # Second pass: create the actual steps with correct dependencies
+    # For circle 1->2->3->4->1:
+    # Step 1 should depend on Step 4's ID (temp_step4.step_id)
+    # Step 2 should depend on Step 1's ID (temp_step1.step_id)
+    # Step 3 should depend on Step 2's ID (temp_step2.step_id)
+    # Step 4 should depend on Step 3's ID (temp_step3.step_id)
+    step1 = create_task_step(0, "Step 1", "Intent 1", "cap1", dependencies=frozenset([temp_step4.step_id]))
+    step2 = create_task_step(1, "Step 2", "Intent 2", "cap2", dependencies=frozenset([temp_step1.step_id]))
+    step3 = create_task_step(2, "Step 3", "Intent 3", "cap3", dependencies=frozenset([temp_step2.step_id]))
+    step4 = create_task_step(3, "Step 4", "Intent 4", "cap4", dependencies=frozenset([temp_step3.step_id]))
 
-class MockScreenshotProvider:
-    def capture(self, path=None):
-        return b"mock-screenshot-data"
-
-
-class MockInputService:
-    def __init__(self):
-        self.call_log = []
-        self.initialized = True
-
-    def initialize(self):
-        self.initialized = True
-
-    def click(self, x=None, y=None, button="left", clicks=1):
-        self.call_log.append({"action": "click", "x": x, "y": y, "button": button, "clicks": clicks})
-        from core.results import ActionResult, ActionStatus
-        return ActionResult(
-            status=ActionStatus.EXECUTED,
-            action_name="click",
-            details={"success": True, "x": x, "y": y, "button": button, "clicks": clicks}
-        )
-
-    def move_mouse(self, x=None, y=None):
-        self.call_log.append({"action": "move", "x": x, "y": y})
-        from core.results import ActionResult, ActionStatus
-        return ActionResult(
-            status=ActionStatus.EXECUTED,
-            action_name="move",
-            details={"success": True, "x": x, "y": y}
-        )
-
-    def type_text(self, text="", target=None):
-        self.call_log.append({"action": "type", "text": text, "target": target})
-        from core.results import ActionResult, ActionStatus
-        return ActionResult(
-            status=ActionStatus.EXECUTED,
-            action_name="type",
-            details={"success": True, "text": text, "target": target}
-        )
-
-
-async def debug_test():
-    print("Setting up components...")
-
-    # Setup real perception adapter (with mocked dependencies for determinism)
-    perception_router = MockPerceptionRouter()
-    screenshot_provider = MockScreenshotProvider()
-    perception_adapter = PerceptionAdapter(perception_router, screenshot_provider)
-    print("Perception adapter created")
-
-    # Setup real grounding provider
-    grounding_provider = DefaultGroundingProvider(TargetResolver())
-    print("Grounding provider created")
-
-    # Setup real action executor with registry containing real capabilities
-    registry = CapabilityRegistry()
-    input_service = MockInputService()
-    registry.register(MouseClickCapability(input_service))
-    registry.register(KeyboardTypeCapability(input_service))
-    router = CapabilityRouter(registry)
-    action_executor = DefaultActionExecutor(router)
-    print("Action executor created")
-
-    # Setup real verification provider
-    verification_provider = DefaultVerificationProvider(perception_adapter)
-    print("Verification provider created")
-
-    # Create execution cycle with real components
-    cycle = ExecutionCycle(
-        perception_provider=perception_adapter,
-        target_resolver=grounding_provider,
-        action_executor=action_executor,
-        verification_provider=verification_provider,
-    )
-    print("Execution cycle created")
-
-    # Create test step with coordinate-based click (no target_query needed)
-    step = ExecutionStep(
-        step_id="debug-test",
-        description="Click at coordinates",
-        action=StepAction.CLICK,
-        capability_name="desktop.mouse.click",
-        parameters={"x": 150, "y": 125},  # Direct coordinates
-        expectation=VerificationExpectation.target_visible("Test Button"),
-    )
-    print("Step created")
-    print(f"Step: {step}")
-
-    # Execute
-    print("Executing step...")
-    result = await cycle.execute(step)
-
-    print(f"Result status: {result.status}")
+    plan2 = create_task_plan("Test goal", (step1, step2, step3, step4))
+    result = plan2.has_circular_dependency()
     print(f"Result: {result}")
-    print(f"Observation: {result.observation}")
-    if result.observation:
-        print(f"Observation status: {result.observation.status}")
-        print(f"Observation candidates: {len(result.observation.candidates) if result.observation.candidates else 0}")
-
-    print(f"Action result: {result.action_result}")
-    if result.action_result:
-        print(f"Action result status: {result.action_result.status}")
-
-    print(f"Verification result: {result.verification_result}")
-    if result.verification_result:
-        print(f"Verification result status: {result.verification_result.status}")
-        print(f"Verification result success: {result.verification_result.success}")
-
-    print("Test completed")
-
+    assert result == True
 
 if __name__ == "__main__":
-    asyncio.run(debug_test())
+    test_task_plan_has_circular_dependency()
+    print("Test passed!")

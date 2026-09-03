@@ -12,6 +12,7 @@ from typing import Any, Protocol, runtime_checkable, Optional, Mapping, Tuple
 from dataclasses import dataclass, field
 
 # Import existing types to avoid circular dependencies and ensure compatibility
+from core.execution.expectation import VerificationExpectation
 from core.orchestration.cancellation import CancellationToken
 from core.results import CapabilityResult
 from core.capability_router import CapabilityRouter

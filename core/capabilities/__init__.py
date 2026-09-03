@@ -82,7 +82,7 @@ def _default_application_service():
 def _default_window_service():
     """Construct the canonical WindowService when one was not injected."""
     try:
-        from core.services.window_service import WindowsWindowService
+        from system.windows.window_service import WindowsWindowService
     except Exception:
         return None
     try:

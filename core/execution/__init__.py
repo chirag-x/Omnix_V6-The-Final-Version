@@ -1,5 +1,5 @@
 """
-Omnix V6 — Execution Cycle Public Interface for Stage 19.0/19.2/19.3.
+Omnix V6 — Execution Cycle Public Interface for Stage 19.0/19.2/19.3 + Stage 20.
 
 Public surface for the execution cycle module.
 """
@@ -14,7 +14,13 @@ from .result import (
     VerificationStatus,
 )
 from .state import ExecutionState
-from .step import ExecutionStep, StepAction
+from .step import (
+    ExecutionStep,
+    StepAction,
+    RecoveryStrategy,
+    RecoveryAttempt,
+    RecoveryContext,
+)
 from .preconditions import (
     Precondition,
     PreconditionResult,
@@ -39,6 +45,14 @@ from .sync import (
     SynchronizationProvider,
     DefaultSynchronizationProvider,
     create_default_synchronization_provider,
+)
+from .recovery import (
+    RecoveryAction,
+    FailureCategory,
+    RecoveryClassifier,
+    RecoveryResult as RecoveryExecutionResult,
+    create_default_recovery_policy,
+    create_classifier,
 )
 from .errors import (
     ExecutionError,
@@ -83,6 +97,17 @@ __all__ = [
     "SynchronizationStatus",
     "SynchronizationContext",
     "SynchronizationResult",
+
+    # Stage 20 — Recovery
+    "RecoveryStrategy",
+    "RecoveryAttempt",
+    "RecoveryContext",
+    "RecoveryAction",
+    "FailureCategory",
+    "RecoveryClassifier",
+    "RecoveryExecutionResult",
+    "create_default_recovery_policy",
+    "create_classifier",
 
     # Errors
     "ExecutionError",

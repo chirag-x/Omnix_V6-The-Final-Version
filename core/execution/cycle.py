@@ -1,11 +1,11 @@
 """
-Omnix V6 — Execution Cycle for Stage 19.3.
+Omnix V6 — Execution Cycle for Stage 19.3 + Stage 20.
 
 Implements the ExecutionCycle class that orchestrates the
 PRECONDITION → OBSERVE → GROUND → ACT → SYNCHRONIZE → VERIFY cycle as a
 deterministic, reusable primitive with strict phase ordering, timeouts,
-cancellation, observation invalidation, state tracking, and bounded
-state-settling synchronization.
+cancellation, observation invalidation, state tracking, bounded
+state-settling synchronization, and bounded failure recovery.
 
 Stage 19.3 adds:
 
@@ -17,13 +17,34 @@ Stage 19.3 adds:
     observations cannot be mistaken for fresh settlement evidence.
   * Structured SynchronizationResult on ExecutionResult for diagnostics.
   * Observability events for SYNCHRONIZATION_* transitions.
+
+Stage 20 adds:
+
+  * Generic, deterministic failure classification via
+    :class:`RecoveryClassifier` (no LLM involvement).
+  * Bounded recovery budget (max_recovery_attempts, max_action_retries).
+  * Per-action retry safety classification (SAFE_TO_RETRY,
+    CONDITIONALLY_RETRYABLE, NOT_RETRYABLE, UNKNOWN).
+  * Idempotency / duplicate-action protection: on verification
+    failure the cycle re-observes and decides whether the action
+    already took effect before retrying.
+  * Recovery-aware execution trace: each recovery attempt is
+    recorded on the :class:`ExecutionStep` and on the
+    :class:`ExecutionResult` trace.
+  * Final result distinction: SUCCESS / RECOVERED /
+    RECOVERY_EXHAUSTED / ABORTED, propagated via
+    :class:`ExecutionResult` ``metadata["final_outcome"]`` to
+    avoid introducing a second competing status enum.
+  * Cancellation and timeout honored during recovery (no orphan
+    retries after the user cancels or after the global budget
+    expires).
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional , List
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -71,6 +92,21 @@ from .errors import (
     VerificationFailedError,
 )
 
+# Stage 20: bounded failure recovery models
+# Canonical names — no aliases.  The ExecutionCycle is the recovery
+# executor; :class:`RecoveryClassifier` is the deterministic decision
+# primitive.
+from .recovery import (
+    RecoveryAction,
+    RecoveryContext,
+    RecoveryClassifier,
+    RecoveryPolicy,
+)
+from .step import (
+    RecoveryStrategy,
+    RecoveryAttempt,
+)
+
 
 @dataclass
 class ExecutionPolicy:
@@ -91,6 +127,31 @@ class ExecutionPolicy:
     synchronization_timeout_s: float = 5.0
     synchronization_poll_interval_s: float = 0.05
     require_settlement: bool = True     # When True, non-SETTLED results fail the step
+    # Stage 20 — bounded recovery
+    enable_recovery: bool = True
+    max_recovery_attempts: int = 2
+    max_action_retries: int = 1
+    max_reobserve_attempts: int = 1
+    max_reground_attempts: int = 1
+    recovery_budget_s: float = 30.0
+    # Retry-safety classification per step category.  The cycle
+    # consults this map to decide whether repeating an action is
+    # safe.  Stage 20 defaults to SAFE for "open_application" /
+    # "focus_window" (idempotent GUI helpers) and UNKNOWN for
+    # everything else — letting a policy override be explicit.
+    action_retry_safety: dict = field(default_factory=lambda: {
+        "open_application": "SAFE_TO_RETRY",
+        "focus_window": "SAFE_TO_RETRY",
+        "wait": "SAFE_TO_RETRY",
+        "screenshot": "SAFE_TO_RETRY",
+    })
+    # How to map a failure status onto a deterministic recovery
+    # strategy.  Each entry is "recoverable" or "non_recoverable".
+    recoverable_statuses: tuple = field(default_factory=lambda: (
+        ExecutionStatus.OBSERVATION_FAILED,
+        ExecutionStatus.GROUNDING_FAILED,
+        ExecutionStatus.SYNCHRONIZATION_FAILED,
+    ))
 
 
 class ExecutionCycle:
@@ -132,20 +193,799 @@ class ExecutionCycle:
         self._policy = policy or ExecutionPolicy()
         self._observability_sink = observability_sink
 
+        # Stage 20: build the recovery decision primitive once.
+        # The classifier is a frozen, deterministic, stateless
+        # decision function; we hold a single instance for the
+        # whole cycle lifetime.  There is no per-instance state to
+        # # keep (counters live in the recovery loop's locals).
+        self._recovery_classifier: RecoveryClassifier = RecoveryClassifier()
+        # The recovery module's RecoveryPolicy is the input the
+        # classifier's :meth:`get_recovery_action` consumes.  We
+        # derive it from the cycle's :class:`ExecutionPolicy` so
+        # the cycle's tuning knobs flow through unchanged.
+        self._recovery_policy: RecoveryPolicy = self._build_recovery_policy(self._policy)
+
+    @staticmethod
+    def _build_recovery_policy(policy: ExecutionPolicy) -> RecoveryPolicy:
+        """Map an :class:`ExecutionPolicy` onto a :class:`RecoveryPolicy`.
+
+        The cycle's policy exposes the same logical bounds in
+        Stage 20 units (recovery budget, max attempts, max
+        replans).  We translate them so the recovery module's
+        decision primitive is fed with the canonical policy.
+        """
+        return RecoveryPolicy(
+            max_attempts_per_step=max(1, int(policy.max_recovery_attempts)),
+            base_backoff_s=0.0,
+            max_backoff_s=max(0.0, policy.recovery_budget_s),
+            max_replans=0,  # Stage 20 does NOT auto-replan in the cycle
+            max_total_runtime_s=max(0.0, policy.recovery_budget_s),
+            transient_retry_enabled=True,
+            persistent_retry_enabled=False,
+            timeout_replan_enabled=False,
+            resource_escalate_enabled=False,
+            consecutive_failure_threshold=max(2, int(policy.max_recovery_attempts)),
+        )
+
     async def execute(
         self,
         step: ExecutionStep,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> ExecutionResult:
         """
-        Execute one PRECONDITION → OBSERVE → GROUND → ACT → VERIFY cycle.
+        Execute one PRECONDITION → OBSERVE → GROUND → ACT → VERIFY cycle
+        with bounded failure recovery (Stage 20).
 
         Args:
             step: The execution step to perform
             cancellation_token: Optional token for cancelling the operation
 
         Returns:
-            ExecutionResult with the outcome of the cycle
+            ExecutionResult with the outcome of the cycle.  When
+            recovery ran, the result is marked SUCCESS only if
+            the recovery produced a verified post-state; otherwise
+            the original failure is reported with
+            metadata["final_outcome"] set to "RECOVERED",
+            "RECOVERY_EXHAUSTED", or "FAILED" so the caller can
+            distinguish "saved by recovery" from "gave up".
+        """
+        if not self._policy.enable_recovery:
+            # Recovery disabled → single deterministic pass.
+            return await self._execute_once(
+                step=step,
+                cancellation_token=cancellation_token,
+            )
+
+        return await self._execute_with_recovery(
+            step=step,
+            cancellation_token=cancellation_token,
+        )
+
+    # ============================================================ recovery
+    async def _execute_with_recovery(
+        self,
+        *,
+        step: ExecutionStep,
+        cancellation_token: Optional[CancellationToken],
+    ) -> ExecutionResult:
+        """Wrap :meth:`_execute_once` with bounded, generic recovery.
+
+        Recovery is fully deterministic:
+
+        * The classifier maps the failed ``ExecutionStatus`` to a
+          recovery action (no LLM, no application knowledge).
+        * Each retry consumes part of the bounded recovery budget
+          declared in :class:`ExecutionPolicy`.
+        * After every action retry the cycle re-observes; if the
+          desired post-state is already there, the cycle reports
+          SUCCESS without running the action again (idempotency
+          protection).
+        * Cancellation and overall budget are honored at every
+          checkpoint — no orphaned retries.
+
+        The loop respects the policy's:
+
+        * ``max_recovery_attempts`` — total recovery iterations
+        * ``max_action_retries`` — explicit action-phase retries
+        * ``max_reobserve_attempts`` — re-observe-only attempts
+        * ``max_reground_attempts`` — re-ground attempts (folded
+          into re-observe for the generic cycle)
+        * ``recovery_budget_s`` — hard wall-clock budget
+        * per-capability ``action_retry_safety`` — only explicit
+          ``SAFE_TO_RETRY`` capabilities may be retried
+        """
+        cycle_start = time.time()
+        deadline = cycle_start + max(0.0, self._policy.recovery_budget_s)
+        attempts_used = 0
+        action_retries_used = 0
+        reobserve_used = 0
+        reground_used = 0
+        last_result: Optional[ExecutionResult] = None
+
+        while True:
+            # Pre-flight: cancellation / deadline / attempt budget
+            if self._is_cancelled(cancellation_token):
+                placeholder = self._cancelled_placeholder(
+                    step, cycle_start, "Cancelled before recovery iteration"
+                )
+                return self._finalize_recovery_result(
+                    placeholder,
+                    final_outcome="CANCELLED",
+                    recovery_reason="cancelled_before_recovery_iteration",
+                )
+            if time.time() > deadline:
+                base = last_result or self._cancelled_placeholder(
+                    step, cycle_start, "Recovery budget exceeded before next attempt"
+                )
+                return self._finalize_recovery_result(
+                    base,
+                    final_outcome="RECOVERY_EXHAUSTED",
+                    recovery_reason="recovery_budget_exceeded",
+                )
+            if attempts_used >= self._policy.max_recovery_attempts:
+                base = last_result or self._cancelled_placeholder(
+                    step, cycle_start, "Recovery attempts exhausted before next attempt"
+                )
+                return self._finalize_recovery_result(
+                    base,
+                    final_outcome="RECOVERY_EXHAUSTED",
+                    recovery_reason="max_recovery_attempts_exceeded",
+                )
+
+            # If the previous failure was observation/grounding and
+            # we still have re-observe / re-ground budget, refresh
+            # the cache before the next cycle so the next pass does
+            # not reuse a stale observation.
+            if last_result is not None and last_result.status in (
+                ExecutionStatus.OBSERVATION_FAILED,
+                ExecutionStatus.GROUNDING_FAILED,
+            ):
+                await self._invalidate_observation_cache()
+
+            # One deterministic pass
+            last_result = await self._execute_once(
+                step=step,
+                cancellation_token=cancellation_token,
+            )
+            attempts_used += 1
+
+            if last_result.status == ExecutionStatus.SUCCESS:
+                return last_result
+
+            # Post-flight: cancellation / deadline
+            if self._is_cancelled(cancellation_token):
+                return self._finalize_recovery_result(
+                    self._clone_result_cancelled(last_result),
+                    final_outcome="CANCELLED",
+                    recovery_reason="cancelled_during_recovery",
+                )
+            if time.time() > deadline:
+                return self._finalize_recovery_result(
+                    last_result,
+                    final_outcome="RECOVERY_EXHAUSTED",
+                    recovery_reason="recovery_budget_exceeded",
+                )
+
+            # Build the deterministic recovery context
+            context = RecoveryContext(
+                step_id=step.step_id,
+                execution_status=last_result.status,
+                error=self._to_execution_error(last_result.error),
+                attempt_count=attempts_used,
+                replan_count=0,
+                elapsed_s=time.time() - cycle_start,
+                consecutive_failures=attempts_used,
+                metadata={},
+            )
+
+            # Deterministic decision
+            category = self._recovery_classifier.classify_failure(
+                status=context.execution_status,
+                error=context.error,
+                consecutive_failures=context.consecutive_failures,
+                metadata=context.metadata,
+            )
+            action = self._recovery_classifier.get_recovery_action(
+                category=category,
+                policy=self._recovery_policy,
+                attempts_used=context.attempt_count,
+                replans_used=context.replan_count,
+                elapsed_s=context.elapsed_s,
+            )
+
+            # --- Terminal classifier actions
+            if action == RecoveryAction.GIVE_UP:
+                return self._finalize_recovery_result(
+                    last_result,
+                    final_outcome="RECOVERY_EXHAUSTED",
+                    recovery_reason="give_up_by_classifier",
+                )
+            if action == RecoveryAction.REPLAN:
+                return self._finalize_recovery_result(
+                    last_result,
+                    final_outcome="REPLAN_NEEDED",
+                    recovery_reason="replan_needed",
+                )
+            if action == RecoveryAction.ESCALATE:
+                return self._finalize_recovery_result(
+                    last_result,
+                    final_outcome="ESCALATE_NEEDED",
+                    recovery_reason="escalate_needed",
+                )
+            if action == RecoveryAction.SKIP:
+                return self._finalize_recovery_result(
+                    last_result,
+                    final_outcome="SKIPPED",
+                    recovery_reason="skipped_by_classifier",
+                )
+
+            # --- RETRY / RETRY_WITH_BACKOFF: dispatch by phase
+            if last_result.status in (
+                ExecutionStatus.OBSERVATION_FAILED,
+                ExecutionStatus.GROUNDING_FAILED,
+            ):
+                if reobserve_used >= self._policy.max_reobserve_attempts or \
+                        reground_used >= self._policy.max_reground_attempts:
+                    return self._finalize_recovery_result(
+                        last_result,
+                        final_outcome="RECOVERY_EXHAUSTED",
+                        recovery_reason="reobserve_or_reground_budget_exhausted",
+                    )
+                reobserve_used += 1
+                reground_used += 1
+                recovered = await self._recover_observation_or_grounding(
+                    step=step,
+                    last_result=last_result,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+                if recovered.metadata.get("final_outcome") in (
+                    "RECOVERY_EXHAUSTED",
+                    "CANCELLED",
+                    "FAILED",
+                ):
+                    return recovered
+                if recovered.status == ExecutionStatus.SUCCESS:
+                    return recovered
+                last_result = recovered
+                continue
+
+            if last_result.status == ExecutionStatus.VERIFICATION_FAILED:
+                # Idempotency: if the post-state already matches the
+                # expectation, we MUST NOT re-run the action.
+                already = await self._post_state_matches_expectation(
+                    step=step,
+                    last_result=last_result,
+                    cancellation_token=cancellation_token,
+                )
+                if already:
+                    recovered = self._clone_result_success(last_result)
+                    return self._finalize_recovery_result(
+                        recovered,
+                        final_outcome="RECOVERED",
+                        recovery_reason="verification_mismatch_already_satisfied",
+                    )
+                if action_retries_used >= self._policy.max_action_retries:
+                    return self._finalize_recovery_result(
+                        last_result,
+                        final_outcome="RECOVERY_EXHAUSTED",
+                        recovery_reason="verification_retry_budget_exhausted",
+                    )
+                action_retries_used += 1
+                recovered = await self._retry_after_verification_failure(
+                    step=step,
+                    last_result=last_result,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+                if recovered.status == ExecutionStatus.SUCCESS:
+                    return recovered
+                if recovered.metadata.get("final_outcome") in (
+                    "FAILED",
+                    "RECOVERY_EXHAUSTED",
+                    "CANCELLED",
+                ):
+                    return recovered
+                last_result = recovered
+                continue
+
+            if last_result.status == ExecutionStatus.ACTION_FAILED:
+                # Action retry is gated on the per-capability safety
+                # map: an UNKNOWN capability is NEVER auto-retried.
+                if action_retries_used >= self._policy.max_action_retries:
+                    return self._finalize_recovery_result(
+                        last_result,
+                        final_outcome="RECOVERY_EXHAUSTED",
+                        recovery_reason="action_retry_budget_exhausted",
+                    )
+                if not self._action_is_retryable(step):
+                    return self._finalize_recovery_result(
+                        last_result,
+                        final_outcome="FAILED",
+                        recovery_reason="action_not_safe_to_retry",
+                    )
+                action_retries_used += 1
+                recovered = await self._retry_action(
+                    step=step,
+                    last_result=last_result,
+                    deadline=deadline,
+                    cancellation_token=cancellation_token,
+                )
+                if recovered.status == ExecutionStatus.SUCCESS:
+                    return recovered
+                if recovered.metadata.get("final_outcome") in (
+                    "FAILED",
+                    "RECOVERY_EXHAUSTED",
+                    "CANCELLED",
+                ):
+                    return recovered
+                last_result = recovered
+                continue
+
+            if last_result.status == ExecutionStatus.SYNCHRONIZATION_FAILED:
+                # Do NOT blindly re-run the action.  Re-observe,
+                # re-sync, re-verify (the next _execute_once pass
+                # will do so after cache invalidation).  No action
+                # retry is consumed here.
+                await self._invalidate_observation_cache()
+                continue
+
+            if last_result.status in (
+                ExecutionStatus.TIMEOUT,
+                ExecutionStatus.CANCELLED,
+                ExecutionStatus.PRECONDITION_FAILED,
+                ExecutionStatus.INCONCLUSIVE,
+            ):
+                # These are not safely auto-recoverable inside the
+                # cycle.  Surface them as terminal failures.
+                return self._finalize_recovery_result(
+                    last_result,
+                    final_outcome="RECOVERY_EXHAUSTED",
+                    recovery_reason=f"non_recoverable_status:{last_result.status.value}",
+                )
+
+            # Unknown status — keep the safety-first default: give up.
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="RECOVERY_EXHAUSTED",
+                recovery_reason="unknown_failure_status",
+            )
+
+    def _cancelled_placeholder(
+        self,
+        step: ExecutionStep,
+        cycle_start: float,
+        reason: str,
+    ) -> ExecutionResult:
+        """Build a minimal ``ExecutionResult`` used when we need a
+        base to stamp recovery metadata on but have no real cycle
+        result yet (e.g. timeout before the first attempt)."""
+        now = time.time()
+        return ExecutionResult(
+            execution_id=str(uuid4()),
+            step_id=step.step_id,
+            status=ExecutionStatus.CANCELLED,
+            started_at=cycle_start,
+            completed_at=now,
+            duration_ms=(now - cycle_start) * 1000,
+            error=reason,
+            trace=ExecutionTrace(),
+        )
+
+    @staticmethod
+    def _to_execution_error(message: Optional[str]) -> Optional["ExecutionError"]:
+        """Wrap a string error in a generic :class:`ExecutionError` so
+        the recovery classifier can carry it through the context."""
+        if not message:
+            return None
+        try:
+            return ExecutionError(message=message)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _recover_observation_or_grounding(
+        self,
+        *,
+        step: ExecutionStep,
+        last_result: ExecutionResult,
+        deadline: float,
+        cancellation_token: Optional[CancellationToken],
+    ) -> ExecutionResult:
+        """Re-observe / re-ground on a transient observation or
+        grounding failure.  Bounded by the policy.
+        """
+        if time.time() > deadline:
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="RECOVERY_EXHAUSTED",
+                recovery_reason="recovery_budget_exceeded",
+            )
+        if self._is_cancelled(cancellation_token):
+            return self._finalize_recovery_result(
+                self._clone_result_cancelled(last_result),
+                final_outcome="CANCELLED",
+                recovery_reason="cancelled_during_recovery",
+            )
+
+        recovery_id = str(uuid4())
+        self._emit_observability(
+            "RECOVERY_STARTED",
+            {
+                "execution_id": recovery_id,
+                "step_id": step.step_id,
+                "failure_status": last_result.status.value,
+                "strategy": "REOBSERVE_OR_REGROUND",
+            },
+        )
+
+        # Invalidate any cached observation so the next iteration
+        # does not reuse stale state.
+        await self._invalidate_observation_cache()
+
+        # Single bounded retry of the cycle.
+        retried = await self._execute_once(
+            step=step,
+            cancellation_token=cancellation_token,
+        )
+        if retried.status == ExecutionStatus.SUCCESS:
+            self._emit_observability(
+                "RECOVERY_SUCCEEDED",
+                {
+                    "execution_id": recovery_id,
+                    "step_id": step.step_id,
+                    "strategy": "REOBSERVE_OR_REGROUND",
+                },
+            )
+            return self._finalize_recovery_result(
+                retried,
+                final_outcome="RECOVERED",
+                recovery_reason="reobserve_succeeded",
+            )
+        return self._finalize_recovery_result(
+            retried if retried.status != last_result.status else last_result,
+            final_outcome="RECOVERY_EXHAUSTED",
+            recovery_reason="reobserve_or_reground_exhausted",
+        )
+
+    async def _retry_after_verification_failure(
+        self,
+        *,
+        step: ExecutionStep,
+        last_result: ExecutionResult,
+        deadline: float,
+        cancellation_token: Optional[CancellationToken],
+    ) -> ExecutionResult:
+        """Bounded action retry after a verification mismatch.
+
+        Stage 20 retries only when:
+
+        * the policy allows ``max_action_retries > 0``
+        * the action is classified as ``SAFE_TO_RETRY`` for the
+          step's ``capability_name``
+        * the recovery budget is not exhausted
+        * cancellation has not been requested
+        """
+        if self._policy.max_action_retries <= 0:
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="FAILED",
+                recovery_reason="action_retry_disabled_by_policy",
+            )
+        if time.time() > deadline:
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="RECOVERY_EXHAUSTED",
+                recovery_reason="recovery_budget_exceeded",
+            )
+        if self._is_cancelled(cancellation_token):
+            return self._finalize_recovery_result(
+                self._clone_result_cancelled(last_result),
+                final_outcome="CANCELLED",
+                recovery_reason="cancelled_during_recovery",
+            )
+
+        if not self._action_is_retryable(step):
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="FAILED",
+                recovery_reason="action_not_safe_to_retry",
+            )
+
+        recovery_id = str(uuid4())
+        self._emit_observability(
+            "RECOVERY_STARTED",
+            {
+                "execution_id": recovery_id,
+                "step_id": step.step_id,
+                "failure_status": last_result.status.value,
+                "strategy": "RETRY_VERIFICATION",
+            },
+        )
+        await self._invalidate_observation_cache()
+
+        retried = await self._execute_once(
+            step=step,
+            cancellation_token=cancellation_token,
+        )
+        if retried.status == ExecutionStatus.SUCCESS:
+            self._emit_observability(
+                "RECOVERY_SUCCEEDED",
+                {
+                    "execution_id": recovery_id,
+                    "step_id": step.step_id,
+                    "strategy": "RETRY_VERIFICATION",
+                },
+            )
+            return self._finalize_recovery_result(
+                retried,
+                final_outcome="RECOVERED",
+                recovery_reason="verification_retry_succeeded",
+            )
+        return self._finalize_recovery_result(
+            retried,
+            final_outcome="RECOVERY_EXHAUSTED",
+            recovery_reason="verification_retry_exhausted",
+        )
+
+    async def _retry_action(
+        self,
+        *,
+        step: ExecutionStep,
+        last_result: ExecutionResult,
+        deadline: float,
+        cancellation_token: Optional[CancellationToken],
+    ) -> ExecutionResult:
+        """Bounded action retry after an :class:`ActionFailed` outcome.
+
+        Same safety rules as :meth:`_retry_after_verification_failure`:
+        retry only when the capability is classified as
+        :data:`SAFE_TO_RETRY` and the policy allows it.
+        """
+        if self._policy.max_action_retries <= 0:
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="FAILED",
+                recovery_reason="action_retry_disabled_by_policy",
+            )
+        if not self._action_is_retryable(step):
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="FAILED",
+                recovery_reason="action_not_safe_to_retry",
+            )
+        if time.time() > deadline:
+            return self._finalize_recovery_result(
+                last_result,
+                final_outcome="RECOVERY_EXHAUSTED",
+                recovery_reason="recovery_budget_exceeded",
+            )
+        if self._is_cancelled(cancellation_token):
+            return self._finalize_recovery_result(
+                self._clone_result_cancelled(last_result),
+                final_outcome="CANCELLED",
+                recovery_reason="cancelled_during_recovery",
+            )
+
+        recovery_id = str(uuid4())
+        self._emit_observability(
+            "RECOVERY_STARTED",
+            {
+                "execution_id": recovery_id,
+                "step_id": step.step_id,
+                "failure_status": last_result.status.value,
+                "strategy": "RETRY_ACTION",
+            },
+        )
+        await self._invalidate_observation_cache()
+        retried = await self._execute_once(
+            step=step,
+            cancellation_token=cancellation_token,
+        )
+        if retried.status == ExecutionStatus.SUCCESS:
+            self._emit_observability(
+                "RECOVERY_SUCCEEDED",
+                {
+                    "execution_id": recovery_id,
+                    "step_id": step.step_id,
+                    "strategy": "RETRY_ACTION",
+                },
+            )
+            return self._finalize_recovery_result(
+                retried,
+                final_outcome="RECOVERED",
+                recovery_reason="action_retry_succeeded",
+            )
+        return self._finalize_recovery_result(
+            retried,
+            final_outcome="RECOVERY_EXHAUSTED",
+            recovery_reason="action_retry_exhausted",
+        )
+
+    async def _post_state_matches_expectation(
+        self,
+        *,
+        step: ExecutionStep,
+        last_result: ExecutionResult,
+        cancellation_token: Optional[CancellationToken],
+    ) -> bool:
+        """On verification failure, take a *fresh* observation and ask
+        the verification provider whether the expectation is now
+        satisfied.  If yes, the action is considered already
+        successful — no duplicate dispatch.
+
+        This is the idempotency / duplicate-action protection
+        required by Stage 20 §11.
+        """
+        try:
+            fresh_perception = await asyncio.wait_for(
+                self._perception_provider.observe(
+                    self._build_perception_request(step),
+                    cancellation_token,
+                ),
+                timeout=self._policy.verification_timeout_s,
+            )
+        except Exception:
+            return False
+        if not getattr(fresh_perception, "status", None):
+            return False
+        try:
+            verify = await asyncio.wait_for(
+                self._verification_provider.verify(
+                    step.expectation,
+                    fresh_perception,
+                    cancellation_token,
+                ),
+                timeout=self._policy.verification_timeout_s,
+            )
+        except Exception:
+            return False
+        return bool(getattr(verify, "success", False))
+
+    def _action_is_retryable(self, step: ExecutionStep) -> bool:
+        """Look up the step's capability in the policy's safety map.
+
+        Capabilities not listed default to UNKNOWN — which is
+        treated as not-safe-to-retry.  This is the conservative
+        Stage 20 default and is the explicit Stage 20 §10 / §57
+        safety boundary.
+        """
+        if not self._policy.action_retry_safety:
+            return False
+        safety = self._policy.action_retry_safety.get(
+            (step.capability_name or "").lower(),
+            "UNKNOWN",
+        )
+        return safety == "SAFE_TO_RETRY"
+
+    async def _invalidate_observation_cache(self) -> None:
+        """Best-effort cache invalidation so a retry does not see
+        the observation that was current *before* the failed
+        action (Stage 20 §30)."""
+        if self._perception_cache is None:
+            return
+        try:
+            invalidate = getattr(self._perception_cache, "invalidate", None)
+            if invalidate is None:
+                return
+            res = invalidate(key=None)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            # Cache invalidation must never fail the cycle.
+            pass
+
+    def _finalize_recovery_result(
+        self,
+        result: ExecutionResult,
+        *,
+        final_outcome: str,
+        recovery_reason: str,
+    ) -> ExecutionResult:
+        """Stamp the final outcome and recovery reason onto a result.
+
+        This is purely additive — the existing :class:`ExecutionResult`
+        ``status`` keeps its original meaning, and the new
+        :data:`final_outcome` is exposed via ``metadata`` so callers
+        can distinguish::
+
+            SUCCESS                → metadata["final_outcome"] == "SUCCESS"
+            FAILED (no recovery)  → "FAILED"
+            FAILED (after recov.) → "RECOVERY_EXHAUSTED"
+            CANCELLED (recover.)  → "CANCELLED"
+            SUCCESS (post-recover.) → "RECOVERED"
+        """
+        # ExecutionResult is frozen; build a new metadata mapping.
+        new_metadata = dict(result.metadata or {})
+        new_metadata["final_outcome"] = final_outcome
+        new_metadata["recovery_reason"] = recovery_reason
+        new_metadata["recovery_enabled"] = True
+        return ExecutionResult(
+            execution_id=result.execution_id,
+            step_id=result.step_id,
+            status=result.status,
+            observation=result.observation,
+            resolved_target=result.resolved_target,
+            action_result=result.action_result,
+            verification_result=result.verification_result,
+            trace=result.trace,
+            pre_state=result.pre_state,
+            post_state=result.post_state,
+            precondition_results=result.precondition_results,
+            synchronization_result=result.synchronization_result,
+            recovery_result=getattr(result, "recovery_result", None),
+            started_at=result.started_at,
+            completed_at=result.completed_at,
+            duration_ms=result.duration_ms,
+            error=result.error,
+            metadata=new_metadata,
+        )
+
+    def _clone_result_success(self, result: ExecutionResult) -> ExecutionResult:
+        """Clone ``result`` but flip ``status`` to SUCCESS and clear
+        ``error`` — used when the recovery idempotency check
+        confirms the post-state already matches the expectation.
+        """
+        new_metadata = dict(result.metadata or {})
+        new_metadata["final_outcome"] = "RECOVERED"
+        new_metadata["recovery_reason"] = "verification_mismatch_already_satisfied"
+        return ExecutionResult(
+            execution_id=result.execution_id,
+            step_id=result.step_id,
+            status=ExecutionStatus.SUCCESS,
+            observation=result.observation,
+            resolved_target=result.resolved_target,
+            action_result=result.action_result,
+            verification_result=result.verification_result,
+            trace=result.trace,
+            pre_state=result.pre_state,
+            post_state=result.post_state,
+            precondition_results=result.precondition_results,
+            synchronization_result=result.synchronization_result,
+            recovery_result=getattr(result, "recovery_result", None),
+            started_at=result.started_at,
+            completed_at=time.time(),
+            duration_ms=(time.time() - result.started_at) * 1000,
+            error="",
+            metadata=new_metadata,
+        )
+
+    def _clone_result_cancelled(self, result: ExecutionResult) -> ExecutionResult:
+        """Clone ``result`` with status CANCELLED."""
+        new_metadata = dict(result.metadata or {})
+        new_metadata["final_outcome"] = "CANCELLED"
+        new_metadata["recovery_reason"] = "cancelled_during_recovery"
+        return ExecutionResult(
+            execution_id=result.execution_id,
+            step_id=result.step_id,
+            status=ExecutionStatus.CANCELLED,
+            observation=result.observation,
+            resolved_target=result.resolved_target,
+            action_result=result.action_result,
+            verification_result=result.verification_result,
+            trace=result.trace,
+            pre_state=result.pre_state,
+            post_state=result.post_state,
+            precondition_results=result.precondition_results,
+            synchronization_result=result.synchronization_result,
+            recovery_result=getattr(result, "recovery_result", None),
+            started_at=result.started_at,
+            completed_at=time.time(),
+            duration_ms=(time.time() - result.started_at) * 1000,
+            error="cancelled during recovery",
+            metadata=new_metadata,
+        )
+
+    async def _execute_once(
+        self,
+        *,
+        step: ExecutionStep,
+        cancellation_token: Optional[CancellationToken],
+    ) -> ExecutionResult:
+        """One deterministic cycle pass — no recovery.
+
+        This is the body of the original ``execute()`` extracted into
+        a helper so the recovery loop in :meth:`_execute_with_recovery`
+        can call it without duplicating phase logic.
         """
         execution_id = str(uuid4())
         start_time = time.time()

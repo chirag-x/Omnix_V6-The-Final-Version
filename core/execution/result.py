@@ -23,6 +23,7 @@ from ..results import (
 if TYPE_CHECKING:
     from .state import ExecutionState
     from .preconditions import PreconditionResult
+    from .recovery import RecoveryResult
 
 
 class ExecutionStatus(str, Enum):
@@ -142,6 +143,8 @@ class ExecutionResult:
                 "synchronization_observation_id": self.trace.synchronization_observation_id,
                 "synchronization_elapsed_ms": self.trace.synchronization_elapsed_ms,
                 "synchronization_poll_count": self.trace.synchronization_poll_count,
+                "recovery_id": self.trace.recovery_id,
+                "recovery_outcome": self.trace.recovery_outcome,
             },
             "started_at": self.started_at,
             "completed_at": self.completed_at,
@@ -154,6 +157,8 @@ class ExecutionResult:
             "precondition_results": [pr.to_dict() if hasattr(pr, 'to_dict') else str(pr) for pr in self.precondition_results],
             # Stage 19.3 addition
             "synchronization_result": self.synchronization_result.to_dict() if hasattr(self.synchronization_result, 'to_dict') else (None if self.synchronization_result is None else str(self.synchronization_result)),
+            # NEW: Recovery result
+            "recovery_result": self.recovery_result.to_dict() if hasattr(self.recovery_result, 'to_dict') else (None if self.recovery_result is None else str(self.recovery_result)),
         }
 
     @staticmethod

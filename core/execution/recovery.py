@@ -8,9 +8,9 @@ in the OBSERVE → GROUND → ACT → VERIFY cycle with bounded retry/replan str
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Mapping, ClassVar
 
 # Import execution status for mapping failures
 from .result import ExecutionStatus
@@ -72,8 +72,10 @@ class RecoveryPolicy:
 class RecoveryClassifier:
     """Classifies execution failures into categories for recovery decisions."""
 
+    consecutive_failure_threshold: int = 3
+
     # Mapping of execution status to failure category
-    STATUS_TO_CATEGORY: Mapping[ExecutionStatus, FailureCategory] = {
+    STATUS_TO_CATEGORY: ClassVar[Mapping[ExecutionStatus, FailureCategory]] = {
         ExecutionStatus.OBSERVATION_FAILED: FailureCategory.TRANSIENT,
         ExecutionStatus.GROUNDING_FAILED: FailureCategory.TRANSIENT,
         ExecutionStatus.ACTION_FAILED: FailureCategory.TRANSIENT,
@@ -86,7 +88,7 @@ class RecoveryClassifier:
     }
 
     # Specific error type mappings
-    ERROR_TYPE_TO_CATEGORY: Mapping[type[ExecutionError], FailureCategory] = {
+    ERROR_TYPE_TO_CATEGORY: ClassVar[Mapping[type[ExecutionError], FailureCategory]] = {
         # Add specific error type mappings as needed
     }
 
@@ -266,6 +268,32 @@ def create_default_recovery_policy() -> RecoveryPolicy:
         resource_escalate_enabled=True,
         consecutive_failure_threshold=3,
     )
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """Result of a recovery action execution."""
+    recovery_id: str
+    action_taken: RecoveryAction
+    success: bool
+    error: Optional[str] = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    started_at: float = 0.0
+    completed_at: float = 0.0
+    duration_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "recovery_id": self.recovery_id,
+            "action_taken": self.action_taken.value,
+            "success": self.success,
+            "error": self.error,
+            "metadata": dict(self.metadata),
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_ms": self.duration_ms,
+        }
 
 
 def create_classifier() -> RecoveryClassifier:

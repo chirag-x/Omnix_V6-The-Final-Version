@@ -26,6 +26,7 @@ from .state.context_service import ContextService
 from .responses import OmnixResponse, ResponseStatus, new_correlation_id
 from .services.readiness import ReadinessGate, ReadinessReport
 from .services.speech_queue import SpeechQueue
+from .task.executor import _TASK_EXECUTOR_AVAILABLE
 from .events.event_types import (
     EngineEvent,
     ErrorEvent,
@@ -91,6 +92,7 @@ class OmnixEngine(LifecycleMixin):
         self._request_count = 0
         self._lifecycle_state = LifecycleState.CREATED
         self._initialization_error = None
+        self.task_executor = None
 
         # Phase 11: canonical request pipeline.  Constructed lazily in
         # ``_do_initialize`` once services, registry, and brain are
@@ -828,6 +830,32 @@ class OmnixEngine(LifecycleMixin):
             # ``getattr(self, "plan_executor", None)`` so this
             # assignment must happen before that call.
             self.plan_executor = plan_executor
+
+            # Phase 21: build the TaskExecutor on top of the PlanExecutor.
+            # The TaskExecutor is the canonical entry point for multi-step
+            # user tasks that span multiple capabilities. It builds on
+            # Stages 18-20 (PlanExecutor → ExecutionCycle → Recovery) and
+            # adds task-level state, lifecycle events, and final verification.
+            try:
+                from core.task.executor import TaskExecutor, TaskExecutorConfig
+                task_executor = TaskExecutor(
+                    plan_executor=plan_executor,
+                    config=TaskExecutorConfig(
+                        max_task_retries=2,
+                        enable_step_recovery=True,
+                        enable_task_replanning=True,
+                        event_publisher=self._build_task_event_publisher(),
+                    ),
+                )
+                self.task_executor = task_executor
+                logger.info("Stage 21 TaskExecutor initialized")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"TaskExecutor build failed: {exc!r}")
+                self.task_executor = None
+
+            # Use TaskExecutor for Stage 21 if available, otherwise fall back to plan_executor
+            effective_plan_executor = self.task_executor if self.task_executor is not None else plan_executor
+
             step_verifier = DefaultStepVerifier()
             goal_verifier = DefaultGoalVerifier()
             recovery_engine = DefaultRecoveryEngine()
@@ -859,10 +887,13 @@ class OmnixEngine(LifecycleMixin):
                 vision_target_provider=vision_target_provider,
             )
 
+            # Use TaskExecutor for Stage 21 if available, otherwise fall back to plan_executor
+            effective_plan_executor = self.task_executor if self.task_executor is not None else plan_executor
+
             agent = Agent(
                 interpreter=interpreter,
                 planner=planner,
-                plan_executor=plan_executor,
+                plan_executor=effective_plan_executor,
                 recovery_engine=recovery_engine,
                 step_verifier=step_verifier,
                 goal_verifier=goal_verifier,
@@ -1209,6 +1240,37 @@ class OmnixEngine(LifecycleMixin):
             )
         except Exception:
             return None
+
+    def _build_task_event_publisher(self) -> Optional[Callable[[str, Dict[str, Any]], None]]:
+        """Build an event publisher for task-level events.
+
+        Returns a callable that publishes task events to the engine's event bus.
+        Returns None if the event bus is not available.
+        """
+        bus = getattr(self, "bus", None)
+        if bus is None:
+            return None
+
+        def _publish_task_event(event_type: str, event_data: Dict[str, Any]) -> None:
+            """Publish a task event to the engine's event bus."""
+            try:
+                # Import here to avoid circular dependencies
+                from .events.event_types import make_event, EngineEvent
+
+                # Create a structured event for task execution
+                evt = make_event(
+                    EngineEvent,
+                    source="task_executor",
+                    **{
+                        "event_type": event_type,
+                        "task_data": event_data
+                    }
+                )
+                bus.publish(evt)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Failed to publish task event {event_type}: {exc!r}")
+
+        return _publish_task_event
 
     # ----------------------------------------------------- Stage 19.3 wiring
     def _build_execution_cycle(self) -> Optional[Any]:
