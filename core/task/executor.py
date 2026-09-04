@@ -635,8 +635,12 @@ class TaskExecutor:
         """Execute a single task step using the PlanExecutor."""
         logger.debug(f"Executing task step via PlanExecutor: {step.step_id}")
 
-        # Convert TaskStep to PlanStep for execution
+        # Convert TaskStep back to PlanStep
         plan_step = self._convert_task_step_to_plan_step(step, plan)
+        
+        # Clear dependencies for isolated execution
+        from dataclasses import replace
+        plan_step = replace(plan_step, depends_on=frozenset())
 
         # Create execution context
         goal = Goal(
@@ -687,6 +691,7 @@ class TaskExecutor:
                         "status": sr.status.value,
                         "duration_ms": sr.duration_ms,
                         "error": sr.error,
+                        "original_step_result": sr,
                     }
                     for sr in execution_result.step_results
                 ],
@@ -913,13 +918,14 @@ class TaskExecutor:
                     sequence=i,
                     description=plan_step.description or f"Execute step {i+1}",
                     intent=plan_step.description or "",
-                    capability=getattr(plan_step, 'kind', 'automation.general'),
+                    capability=getattr(plan_step, 'capability_name', 'automation.general'),
                     parameters=getattr(plan_step, 'parameters', {}),
-                    expected_result=getattr(plan_step, 'success_criteria', [""])[0] if getattr(plan_step, 'success_criteria', None) else "",
+                    expected_result=plan_step.expected_effect.check_name if getattr(plan_step, 'expected_effect', None) else "",
                     verification_capability="",  # Would need to be mapped
-                    dependencies=frozenset(getattr(plan_step, 'dependencies', [])),
+                    dependencies=frozenset(getattr(plan_step, 'depends_on', [])),
                     timeout_s=30.0,  # Default timeout
-                    max_retries=3
+                    max_retries=3,
+                    step_id=plan_step.step_id
                 )
                 task_steps.append(task_step)
 
@@ -973,6 +979,11 @@ class TaskExecutor:
             for sr_dict in task_result.metadata['step_results']:
                 # The dict might have 'result' with detailed fields, or direct fields
                 res = sr_dict.get('result', {})
+                
+                if "step_results" in res and res["step_results"] and "original_step_result" in res["step_results"][0]:
+                    sr_objects.append(res["step_results"][0]["original_step_result"])
+                    continue
+                    
                 status_str = res.get('status') or res.get('execution_outcome') or (
                     'completed' if sr_dict.get('success') else 'failed'
                 )
@@ -981,7 +992,7 @@ class TaskExecutor:
                 try:
                     status = StepState(status_str.lower())
                 except ValueError:
-                    status = StepState.COMPLETED if sr_dict.get('success') else StepState.FAILED
+                    status = StepState.SUCCEEDED if sr_dict.get('success') else StepState.FAILED
                     
                 sr_objects.append(
                     StepResult(

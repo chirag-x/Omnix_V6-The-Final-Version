@@ -427,11 +427,12 @@ def create_task_step(
     dependencies: Optional[FrozenSet[str]] = None,
     timeout_s: float = 30.0,
     max_retries: int = 3,
-    metadata: Optional[Mapping[str, Any]] = None
+    metadata: Optional[Mapping[str, Any]] = None,
+    step_id: Optional[str] = None,
 ) -> TaskStep:
     """Create a new task step."""
     return TaskStep(
-        step_id=str(uuid4()),
+        step_id=step_id if step_id else str(uuid4()),
         sequence=sequence,
         description=description,
         intent=intent,

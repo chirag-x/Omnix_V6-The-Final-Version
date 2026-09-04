@@ -126,6 +126,7 @@ def register_standard_capabilities(
     application_service: Any = None,
     input_service: Any = None,
     window_service: Any = None,
+    ai_provider: Any = None,
 ) -> None:
     """Register all built-in capabilities with the given registry.
 
@@ -145,6 +146,10 @@ def register_standard_capabilities(
     app_service = application_service or _default_application_service()
     inp_service = input_service or _default_input_service()
     win_service = window_service or _default_window_service()
+
+    # AI Escalation Capability
+    from .ai_capabilities import AIGenerateCapability
+    registry.register(AIGenerateCapability(ai_provider=ai_provider))
 
     # Filesystem
     registry.register(FileReadCapability())

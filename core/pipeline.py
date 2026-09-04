@@ -13,6 +13,8 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
+from loguru import logger
+
 from core.responses import (
     OmnixResponse,
     ResponseStatus,
@@ -127,81 +129,6 @@ class RequestPipeline:
             )
         t0 = time.time()
         metadata: dict[str, Any] = {"correlation_id": cid}
-
-        # 0. Fast path — single-step app commands.
-        if self.app_dispatcher is not None:
-            try:
-                fast = self.app_dispatcher.try_dispatch(text)
-            except Exception:
-                fast = None
-            if fast is not None:
-                # Map a CapabilityResult onto an OmnixResponse.  We
-                # only short-circuit when the resolver was confident
-                # (status VERIFIED).  Honest not-found is reported
-                # back to the user as a FAILED response.
-                from core.results import CapabilityStatus
-                if fast.status == CapabilityStatus.VERIFIED:
-                    details = fast.details or {}
-                    text_out = self._fast_path_user_text(fast)
-                    metadata = {
-                        **metadata,
-                        "fast_path": True,
-                        "capability": fast.capability_name,
-                    }
-                    # Phase 1 / D20: a fast-path success is a
-                    # one-shot capability that already returned
-                    # VERIFIED.  Surface that fact in agent_state
-                    # so the response shape matches the full-path
-                    # response (observability alignment — Phase 7).
-                    # We use COMPLETE because the goal was achieved
-                    # in a single step without entering the closed
-                    # loop.
-                    # Phase 4: second-seam cancellation check.  The
-                    # fast-path matched and verified above, but the
-                    # user may have cancelled while we were running.
-                    # Honoring the token here keeps the fast path
-                    # and the full path on the same observability
-                    # contract.
-                    if cancellation_token is not None and getattr(
-                        cancellation_token, "is_cancelled", False
-                    ):
-                        return OmnixResponse(
-                            text=safe_default_text(ResponseStatus.CANCELLED),
-                            status=ResponseStatus.CANCELLED,
-                            agent_state=AgentState.CANCELLED,
-                            correlation_id=cid,
-                            duration_ms=(time.time() - t0) * 1000.0,
-                            metadata={
-                                **metadata,
-                                "cancelled": True,
-                                "fast_path": True,
-                            },
-                            error=(
-                                getattr(cancellation_token, "reason", "")
-                                or "cancelled before fast-path return"
-                            ),
-                        )
-                    return OmnixResponse(
-                        text=text_out,
-                        status=ResponseStatus.OK,
-                        agent_state=AgentState.COMPLETE,
-                        correlation_id=cid,
-                        duration_ms=(time.time() - t0) * 1000.0,
-                        metadata=metadata,
-                        error=None,
-                    )
-                # Not-found or ambiguous — surface to the user as a
-                # FAILED response with a clear message.
-                err = (fast.error.message if fast.error else "not_found")
-                return OmnixResponse(
-                    text=safe_default_text(ResponseStatus.FAILED),
-                    status=ResponseStatus.FAILED,
-                    agent_state=AgentState.FAILED,
-                    correlation_id=cid,
-                    duration_ms=(time.time() - t0) * 1000.0,
-                    metadata={**metadata, "fast_path": True, "error": err},
-                    error=err,
-                )
 
         # 1. Brain (intent + planning, with memory retrieval if available)
         brain_result = None

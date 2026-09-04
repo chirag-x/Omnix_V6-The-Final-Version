@@ -114,6 +114,7 @@ class IntentKind(str, Enum):
     FILE_COPY = "file_copy"                        # duplicate files
     FILE_DELETE = "file_delete"                    # remove files
     WINDOW_MANAGE = "window_manage"                # generic window action
+    GENERATE_CONTENT = "generate_content"          # request AI generation of text, code, or content
     QUERY_STATUS = "query_status"                  # ask the world a question
     CANCEL_TASK = "cancel_task"                    # halt an in-flight plan
     NO_OP = "no_op"                                # ack / no work needed

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Omnix V6 - The Omnix Engine (Phase 1).
 
 The Engine is the root orchestrator (R-1: "thin orchestrator").
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from loguru import logger
 
@@ -145,12 +145,14 @@ class OmnixEngine(LifecycleMixin):
             application_service = self._resolve_application_service()
             input_service = self._resolve_input_service()
             window_service = self._resolve_window_service()
+            ai_provider = self._resolve_llm_provider()
             register_standard_capabilities(
                 self.capabilities,
                 browser_service=browser_service,
                 application_service=application_service,
                 input_service=input_service,
                 window_service=window_service,
+                ai_provider=ai_provider,
             )
             self._standard_capabilities_seeded = True
 
@@ -769,20 +771,39 @@ class OmnixEngine(LifecycleMixin):
         try:
             from ai.intent.interpreter import LLMIntentInterpreter
             from ai.intent.specs import build_default_registry
-            interpreter = LLMIntentInterpreter(
+            from core.intelligence.native_intent_interpreter import NativeIntentInterpreter
+            from core.intelligence.hybrid_pipeline import HybridIntentInterpreter
+            
+            llm_interpreter = LLMIntentInterpreter(
                 provider=llm_provider,
                 registry=build_default_registry(),
+            )
+            native_interpreter = NativeIntentInterpreter()
+            interpreter = HybridIntentInterpreter(
+                native_interpreter=native_interpreter,
+                llm_interpreter=llm_interpreter,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Intent interpreter build failed: {exc!r}")
             return None
 
-        # 3. Build the deterministic Planner (no LLM dependency)
+        # 3. Build the Hybrid Planner (Native -> LLM fallback)
         try:
             from ai.brain.deterministic import DeterministicPlanner
-            planner = DeterministicPlanner(registry=self.capabilities)
+            from core.intelligence.capability_resolver import CapabilityResolver
+            from core.intelligence.native_task_planner import NativeTaskPlanner
+            from core.intelligence.hybrid_pipeline import HybridPlanner
+            
+            resolver = CapabilityResolver(self.capabilities)
+            native_planner = NativeTaskPlanner(resolver)
+            llm_fallback = DeterministicPlanner(registry=self.capabilities) # We use Deterministic as the 'LLM' fallback to match original engine behavior, though in a real system it would be LLMPlanner
+            
+            planner = HybridPlanner(
+                native_planner=native_planner,
+                llm_planner=llm_fallback,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Deterministic planner build failed: {exc!r}")
+            logger.warning(f"Planner build failed: {exc!r}")
             return None
 
         # 4. Build the Brain
