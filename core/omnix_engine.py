@@ -1433,7 +1433,7 @@ class OmnixEngine(LifecycleMixin):
                 target_resolver=target_resolver,
                 action_executor=action_executor,
                 verification_provider=verification_provider,
-                perception_cache=None,
+                perception_cache=perception_provider,  # Stage 23: Cache invalidation
                 precondition_provider=None,
                 synchronization_provider=sync_provider,
                 policy=policy,

@@ -91,9 +91,16 @@ class OCRStrategy(PerceptionStrategy):
                 continue
 
             text_str = (text or "").lower()
-            if not text_str:
+            if not text_str and lower_query != "*":
                 continue
-            if lower_query in text_str or text_str in lower_query:
+            
+            is_match = False
+            if lower_query == "*":
+                is_match = True
+            elif text_str and (lower_query in text_str or text_str in lower_query):
+                is_match = True
+                
+            if is_match:
                 candidates.append(
                     TargetCandidate(
                         source_type=ObservationSource.OCR,

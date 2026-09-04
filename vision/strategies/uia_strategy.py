@@ -79,11 +79,16 @@ class UIAStrategy(PerceptionStrategy):
                         continue
 
                     name = (el.window_text() or "").lower()
-                    if not name:
-                        continue
-                    # Substring containment in either direction --
+                    
+                    # Substring containment in either direction, or wildcard
                     # UIA is deterministic and live.
-                    if lower_query in name or name in lower_query:
+                    is_match = False
+                    if lower_query == "*":
+                        is_match = True
+                    elif name and (lower_query in name or name in lower_query):
+                        is_match = True
+                        
+                    if is_match:
                         rect = el.rectangle()
                         if rect.width() > 0 and rect.height() > 0:
                             candidates.append(
@@ -100,6 +105,11 @@ class UIAStrategy(PerceptionStrategy):
                                     properties={
                                         "control_type": el.friendly_class_name()
                                     },
+                                    element_type=el.friendly_class_name(),
+                                    name=el.window_text(),
+                                    window_id=win.handle if hasattr(win, 'handle') else None,
+                                    enabled=el.is_enabled(),
+                                    visible=el.is_visible(),
                                 )
                             )
             except Exception:

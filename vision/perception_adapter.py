@@ -117,29 +117,26 @@ class PerceptionAdapter(PerceptionProvider):
     ) -> PerceptionResult:
         """
         Observe current computer state and return structured observations.
-
-        This method adapts the existing PerceptionRouter to the canonical
-        PerceptionProvider interface.
+        Stage 23: Complete multi-layered sweep (Window State + UIA + OCR)
         """
         start_time = time.time()
-
+        
         # Check for cancellation
         if cancellation_token and hasattr(cancellation_token, 'cancelled') and cancellation_token.cancelled:
             return PerceptionResult(
-                observation_id="",  # Will be set by __post_init__
-                timestamp=None,     # Will be set by __post_init__
+                observation_id="",
+                timestamp=None,
                 screen=self._get_screen_info(),
                 status=PerceptionStatus.CANCELLED,
                 duration_ms=(time.time() - start_time) * 1000
             )
 
         try:
-            # Determine if we need a screenshot based on request and available strategies
             needs_screenshot = self._needs_screenshot(request)
-
-            # Capture screenshot if needed
             screenshot_path = None
             screenshot_bytes = None
+            
+            # 1. LAYER B: Screenshot
             if needs_screenshot and request.include_screenshot:
                 import tempfile
                 import os
@@ -152,62 +149,116 @@ class PerceptionAdapter(PerceptionProvider):
                         with open(result_path, 'rb') as f:
                             screenshot_bytes = f.read()
                 finally:
-                    # Clean up temporary file
                     if screenshot_path and os.path.exists(screenshot_path):
                         os.unlink(screenshot_path)
 
-            # Convert PerceptionRequest to perception router query
-            # For now, we'll use a generic observation query
-            # In a full implementation, this would be more sophisticated
-            target_query = "*"  # Observe everything
-
-            # Use the perception router to get candidates
-            # Note: The existing router is synchronous, so we wrap it in asyncio.to_thread
-            # or run it directly if we're already in an async context
-            try:
-                # Try to run without screenshot first (UIA/coordinates strategies)
-                candidates = self._router.find_targets(
-                    target_query=target_query,
-                    image_path=None
-                )
-
-                # If we need more data and have a screenshot, try with screenshot
-                if needs_screenshot and screenshot_bytes and len(candidates) == 0:
-                    # Save screenshot to temp file for strategies that need it
-                    import tempfile
-                    import os
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        tmp_path = tmp.name
-                        tmp.write(screenshot_bytes)
-
-                    try:
-                        candidates = self._router.find_targets(
-                            target_query=target_query,
-                            image_path=tmp_path
-                        )
-                    finally:
-                        if os.path.exists(tmp_path):
-                            os.unlink(tmp_path)
-
-            except (AmbiguityError, TargetNotGroundedError) as e:
-                # These are expected - we still return what we have
-                # The ambiguity/error information can be preserved in metadata
-                candidates = getattr(e, 'candidates', []) if hasattr(e, 'candidates') else []
-
-            # Convert observation sources to PerceptionSource enums
-            perception_sources = self._convert_observation_sources(
-                [getattr(c, 'source_type', ObservationSource.DERIVED) for c in candidates]
-            )
-
-            # Get window context if requested
-            window_context = None
+            # 2. LAYER A: System / Window State
+            active_window = None
+            windows_list = []
+            applications_set = set()
+            
             if request.include_window_context:
-                window_context = self._get_window_context()
-
-            # Determine perception status
+                active_window = self._get_window_context()
+                
+                # Enumerate all visible windows
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    user32 = ctypes.windll.user32
+                    
+                    def enum_windows_proc(hwnd, lParam):
+                        if user32.IsWindowVisible(hwnd):
+                            length = user32.GetWindowTextLengthW(hwnd)
+                            if length > 0:
+                                buffer = ctypes.create_unicode_buffer(length + 1)
+                                user32.GetWindowTextW(hwnd, buffer, length + 1)
+                                title = buffer.value
+                                
+                                rect = wintypes.RECT()
+                                bounds = None
+                                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                                    bounds = (rect.left, rect.top, rect.right, rect.bottom)
+                                
+                                # Extract process
+                                pid = ctypes.c_ulong()
+                                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                                app_name = None
+                                try:
+                                    import psutil
+                                    app_name = psutil.Process(pid.value).name().lower().rstrip('.exe')
+                                    if app_name:
+                                        applications_set.add(app_name)
+                                except Exception:
+                                    pass
+                                    
+                                windows_list.append(WindowContext(
+                                    hwnd=hwnd,
+                                    title=title,
+                                    application=app_name,
+                                    bounds=bounds,
+                                    is_foreground=(active_window and active_window.hwnd == hwnd)
+                                ))
+                        return True
+                        
+                    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+                    user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
+                except Exception:
+                    pass
+            
+            # 3. LAYER C: Elements & Text Regions
+            target_query = "*"
+            elements = []
+            text_regions = []
+            
+            try:
+                # Run UIA Strategy specifically for elements
+                try:
+                    from vision.strategies.uia_strategy import UIAStrategy
+                    uia = UIAStrategy()
+                    if uia:
+                        elements = uia.find_targets(target_query=target_query, image_path=None)
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+                    
+                # Run OCR Strategy specifically for text if requested
+                if request.include_ocr and screenshot_bytes:
+                    try:
+                        from vision.strategies.ocr_strategy import OCRStrategy
+                        ocr = OCRStrategy()
+                        if ocr:
+                            import tempfile
+                            import os
+                            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                                tmp_path = tmp.name
+                                tmp.write(screenshot_bytes)
+                            try:
+                                text_regions = ocr.find_targets(target_query=target_query, image_path=tmp_path)
+                            finally:
+                                if os.path.exists(tmp_path):
+                                    os.unlink(tmp_path)
+                    except ImportError:
+                        pass
+                    except Exception:
+                        pass
+                        
+            except (AmbiguityError, TargetNotGroundedError):
+                pass
+                
+            # Filter and deduplicate elements and text_regions if necessary
+            # (Stage 23 fusion)
+            
+            # Populate candidates for legacy support
+            all_candidates = elements + text_regions
+            
+            perception_sources = self._convert_observation_sources(
+                [getattr(c, 'source_type', ObservationSource.DERIVED) for c in all_candidates]
+            )
+            
             status = self._determine_perception_status(
                 request=request,
-                candidates=candidates,
+                candidates=all_candidates,
                 screenshot_available=screenshot_bytes is not None and request.include_screenshot,
                 needs_screenshot=needs_screenshot
             )
@@ -215,28 +266,33 @@ class PerceptionAdapter(PerceptionProvider):
             duration_ms = (time.time() - start_time) * 1000
 
             return PerceptionResult(
-                observation_id="",  # Will be set by __post_init__
-                timestamp=None,     # Will be set by __post_init__
+                observation_id="",
+                timestamp=None,
                 screen=self._get_screen_info(),
                 screenshot=screenshot_bytes,
-                candidates=tuple(candidates),
-                window_context=window_context,
+                candidates=tuple(all_candidates),
+                window_context=active_window,
+                active_window=active_window,
+                windows=tuple(windows_list),
+                applications=tuple(applications_set),
+                elements=tuple(elements),
+                text_regions=tuple(text_regions),
                 sources=tuple(perception_sources),
                 duration_ms=duration_ms,
                 status=status,
                 metadata={
-                    "router_query": target_query,
                     "needs_screenshot": needs_screenshot,
                     "screenshot_used": screenshot_bytes is not None
                 }
             )
 
         except Exception as e:
-            # Return failed perception result
+            import traceback
+            traceback.print_exc()
             duration_ms = (time.time() - start_time) * 1000
             return PerceptionResult(
-                observation_id="",  # Will be set by __post_init__
-                timestamp=None,     # Will be set by __post_init__
+                observation_id="",
+                timestamp=None,
                 screen=self._get_screen_info(),
                 status=PerceptionStatus.FAILED,
                 duration_ms=duration_ms,

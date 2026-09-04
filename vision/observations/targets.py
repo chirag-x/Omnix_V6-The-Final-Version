@@ -15,6 +15,19 @@ class TargetCandidate:
     text: Optional[str] = None   # extracted text if any
     properties: Dict[str, Any] = field(default_factory=dict) # UIA attributes, yolo class, etc.
     timestamp: float = field(default_factory=time.time)   # timestamp when the candidate was observed
+    
+    # Generic structured perception fields
+    element_id: Optional[str] = None
+    element_type: Optional[str] = None
+    role: Optional[str] = None
+    name: Optional[str] = None
+    window_id: Optional[int] = None
+    application_id: Optional[str] = None
+    enabled: bool = True
+    visible: bool = True
+    focused: bool = False
+    selected: bool = False
+    value: Optional[str] = None
 
 @dataclass(frozen=True)
 class GroundedTarget:

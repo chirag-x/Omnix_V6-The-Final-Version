@@ -119,11 +119,18 @@ class PerceptionResult:
     # Optional perception data
     screenshot: Optional[bytes] = None  # Raw screenshot bytes if requested
 
-    # Observation candidates from perception sources
+    # Observation candidates from perception sources (legacy support)
     candidates: Tuple[TargetCandidate, ...] = field(default_factory=tuple)
 
-    # Window context for the observation
+    # Window context for the observation (legacy support)
     window_context: Optional[WindowContext] = None
+    
+    # Stage 23: Rich Structured Perception
+    active_window: Optional[WindowContext] = None
+    windows: Tuple[WindowContext, ...] = field(default_factory=tuple)
+    applications: Tuple[str, ...] = field(default_factory=tuple)
+    elements: Tuple[TargetCandidate, ...] = field(default_factory=tuple)
+    text_regions: Tuple[TargetCandidate, ...] = field(default_factory=tuple)
 
     # Which perception sources contributed to this result
     sources: Tuple[PerceptionSource, ...] = field(default_factory=tuple)
