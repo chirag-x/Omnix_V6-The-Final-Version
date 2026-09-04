@@ -87,7 +87,7 @@ class CapabilityScreenshotProvider:
         status = getattr(result, "status", None)
         status_name = getattr(status, "name", str(status) or "")
         if status_name not in ("VERIFIED", "EXECUTED"):
-            logger.debug(
+            print(
                 f"[vision] screenshot capability did not succeed: "
                 f"status={status_name!r}"
             )

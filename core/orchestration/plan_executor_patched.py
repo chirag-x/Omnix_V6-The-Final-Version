@@ -106,8 +106,7 @@ try:
         DefaultGroundingProvider,
     )
     _STAGE19_AVAILABLE = True
-except Exception as e:
-    print(f"_STAGE19_AVAILABLE import error: {e}")
+except Exception:
     _STAGE19_AVAILABLE = False
 
 
@@ -493,14 +492,23 @@ class PlanExecutor:
 
     # =========================================================== step
     def _run_step(
-        self,
-        *,
-        context: ExecutionContext,
-        step: PlanStep,
-        upstream_failed: Set[str],
-        correlation_id: str,
-        attempt: int,
-    ) -> StepResult:
+            self,
+            *,
+            context: ExecutionContext,
+            step: PlanStep,
+            upstream_failed: Set[str],
+            correlation_id: str,
+            attempt: int,
+        ) -> StepResult:
+        print(f'cycle is {self.execution_cycle}')
+        # self,
+        # *,
+        # context: ExecutionContext,
+        # step: PlanStep,
+        # upstream_failed: Set[str],
+        # correlation_id: str,
+        # attempt: int,
+        # ) -> StepResult:
         """Run one step and return a :class:`StepResult`.
 
         The function never raises for *plan*-level failures (unknown
@@ -693,7 +701,6 @@ class PlanExecutor:
         step_timeout: float,
         cancellation_token: Optional[Any],
     ) -> Any:
-        print(f"XXX _dispatch_via_execution_cycle calling execution_cycle type: {type(self.execution_cycle)}")
         """Build an :class:`ExecutionStep` and run it through the cycle.
 
         Returns a :class:`core.results.CapabilityResult` so the

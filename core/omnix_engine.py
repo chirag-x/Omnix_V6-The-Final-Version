@@ -234,7 +234,7 @@ class OmnixEngine(LifecycleMixin):
                 try:
                     self.announce_ready()
                 except Exception:  # noqa: BLE001
-                    logger.debug("auto-announce failed; continuing", exc_info=True)
+                    print("auto-announce failed; continuing", exc_info=True)
 
         # 5. Emit initialized event
         self.bus.publish(make_event(EngineEvent, source="engine", transition="ready"))
@@ -386,7 +386,7 @@ class OmnixEngine(LifecycleMixin):
             from voice.startup_announcer import StartupAnnouncer
             from voice.progress_bridge import VoiceProgressBridge
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Voice subsystems not available: {exc!r}")
+            print(f"Voice subsystems not available: {exc!r}")
             return
         try:
             self._startup_announcer = StartupAnnouncer(self.speech_queue)
@@ -413,7 +413,7 @@ class OmnixEngine(LifecycleMixin):
             from voice.runtime import VoiceRuntime
             from core.state.inactivity_timer import InactivityTimer
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Voice runtime modules unavailable: {exc!r}")
+            print(f"Voice runtime modules unavailable: {exc!r}")
             return
 
         wake_phrase = getattr(self.config, "wake_phrase", "omnix") or "omnix"
@@ -460,7 +460,7 @@ class OmnixEngine(LifecycleMixin):
         try:
             self.voice_runtime.start()
         except Exception:  # noqa: BLE001
-            logger.debug("VoiceRuntime start() raised; continuing", exc_info=True)
+            print("VoiceRuntime start() raised; continuing", exc_info=True)
         try:
             if self.inactivity_timer is not None:
                 self.inactivity_timer.start()
@@ -483,7 +483,7 @@ class OmnixEngine(LifecycleMixin):
             self.voice_runtime.set_on_command(self._on_voice_command)
             self.voice_runtime.start_listen_loop()
         except Exception:  # noqa: BLE001
-            logger.debug("voice listen loop could not start", exc_info=True)
+            print("voice listen loop could not start", exc_info=True)
 
     def _on_inactivity_timeout(self) -> None:
         """InactivityTimer callback: transition the runtime to SLEEPING."""
@@ -589,7 +589,7 @@ class OmnixEngine(LifecycleMixin):
         try:
             from voice.tts.sapi_provider import SAPITTSProvider
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"SAPI TTS provider unavailable: {exc!r}")
+            print(f"SAPI TTS provider unavailable: {exc!r}")
             return False
         try:
             provider = SAPITTSProvider()
@@ -725,7 +725,7 @@ class OmnixEngine(LifecycleMixin):
             )
             return CapabilityResult(
                 name=capability_name,
-                status=CapabilityStatus.ERROR,
+                status=CapabilityStatus.FAILED,
                 error=msg,
             )
 
@@ -733,7 +733,7 @@ class OmnixEngine(LifecycleMixin):
         with self._lock:
             self._execution_count += 1
 
-        logger.debug(f">> [Engine] Executing {capability_name}...")
+        print(f">> [Engine] Executing {capability_name}...")
         result = self.router.route(capability_name, **kwargs)
         duration = (time.time() - start_time) * 1000.0
 
@@ -1168,7 +1168,7 @@ class OmnixEngine(LifecycleMixin):
                     # Last-resort: drop silently.
                     pass
             except Exception:  # noqa: BLE001
-                logger.debug(
+                print(
                     "agent observability_sink failed for kind={!r}", kind,
                 )
 
@@ -1289,7 +1289,7 @@ class OmnixEngine(LifecycleMixin):
                 )
                 bus.publish(evt)
             except Exception as exc:  # noqa: BLE001
-                logger.debug(f"Failed to publish task event {event_type}: {exc!r}")
+                print(f"Failed to publish task event {event_type}: {exc!r}")
 
         return _publish_task_event
 
@@ -1328,7 +1328,7 @@ class OmnixEngine(LifecycleMixin):
                 PerceptionRequest,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
+            print(
                 f"Stage 19.3 execution cycle modules unavailable: {exc!r}"
             )
             return None
@@ -1346,7 +1346,7 @@ class OmnixEngine(LifecycleMixin):
                 from vision.perception_adapter import NullPerceptionProvider
                 perception_provider = NullPerceptionProvider()
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
+            print(
                 f"Perception provider unavailable; using Null: {exc!r}"
             )
             try:
@@ -1366,7 +1366,7 @@ class OmnixEngine(LifecycleMixin):
                 screen_height=screen_h,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"TargetResolver construction failed: {exc!r}")
+            print(f"TargetResolver construction failed: {exc!r}")
             return None
 
         # ---- ActionExecutor: adapts the existing
@@ -1375,7 +1375,7 @@ class OmnixEngine(LifecycleMixin):
         try:
             action_executor = DefaultActionExecutor(_router=self.router)
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"ActionExecutor construction failed: {exc!r}")
+            print(f"ActionExecutor construction failed: {exc!r}")
             return None
 
         # ---- VerificationProvider: wraps the perception
@@ -1385,7 +1385,7 @@ class OmnixEngine(LifecycleMixin):
                 _perception_provider=perception_provider,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"VerificationProvider construction failed: {exc!r}")
+            print(f"VerificationProvider construction failed: {exc!r}")
             return None
 
         # ---- GroundingProvider: adapts the TargetResolver.
@@ -1394,7 +1394,7 @@ class OmnixEngine(LifecycleMixin):
                 _resolver=target_resolver,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"GroundingProvider construction failed: {exc!r}")
+            print(f"GroundingProvider construction failed: {exc!r}")
             return None
 
         # ---- SynchronizationProvider (Stage 19.3): state
@@ -1404,7 +1404,7 @@ class OmnixEngine(LifecycleMixin):
                 perception_provider=perception_provider,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"SynchronizationProvider construction failed: {exc!r}")
+            print(f"SynchronizationProvider construction failed: {exc!r}")
             sync_provider = None
 
         # ---- Policy: production defaults — sync enabled,
@@ -1424,7 +1424,7 @@ class OmnixEngine(LifecycleMixin):
                 require_preconditions=False,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"ExecutionPolicy construction failed: {exc!r}")
+            print(f"ExecutionPolicy construction failed: {exc!r}")
             return None
 
         try:
@@ -1440,51 +1440,35 @@ class OmnixEngine(LifecycleMixin):
                 observability_sink=None,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"ExecutionCycle construction failed: {exc!r}")
+            print(f"ExecutionCycle construction failed: {exc!r}")
             return None
 
         return cycle
 
     def _build_perception_provider(self) -> Optional[Any]:
-        """Construct a :class:`PerceptionProvider` for the cycle.
-
-        Prefers an existing service named ``perception_provider``;
-        otherwise returns ``None`` and the cycle is constructed
-        with a NullPerceptionProvider.
-        """
-        existing = self.services.try_resolve("perception_provider")
-        if existing is not None:
-            return existing
+        """Stage 23 Perception Adapter construction."""
         try:
-            from vision.perception_adapter import (
-                CapabilityPerceptionProvider,
-            )
-            from vision.router.screenshot_provider import (
-                CapabilityScreenshotProvider,
-            )
-            # Build a screenshot provider from the engine.  Falls
-            # back to Null when vision is not available.
+            from vision.perception_adapter import PerceptionAdapter
+            from vision.router.perception_router import PerceptionRouter
+            from vision.strategies.uia_strategy import UIAStrategy
+            from vision.strategies.ocr_strategy import OCRStrategy
+            from vision.strategies.visual_strategy import VisualStrategy
+            from vision.strategies.coordinates_strategy import CoordinatesStrategy
+            from vision.router.screenshot_provider import make_screenshot_provider, NullScreenshotProvider
+            from vision.perception_cache import CachedPerceptionProvider, LRUPerceptionCache
+            
             try:
-                from vision.router.screenshot_provider import (
-                    make_screenshot_provider,
-                )
-                screenshot_provider = make_screenshot_provider(
-                    self,
-                    headless=not bool(getattr(self.config, "enable_vision", False)),
-                )
+                screenshot_provider = make_screenshot_provider(self, headless=False)
             except Exception:
-                from vision.router.screenshot_provider import (
-                    NullScreenshotProvider,
-                )
                 screenshot_provider = NullScreenshotProvider()
-            return CapabilityPerceptionProvider(
-                router=self.router,
-                screenshot_provider=screenshot_provider,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                f"CapabilityPerceptionProvider unavailable: {exc!r}"
-            )
+                
+            router = PerceptionRouter(strategies=[UIAStrategy(), OCRStrategy(), VisualStrategy(), CoordinatesStrategy()])
+            
+            base_provider = PerceptionAdapter(router, screenshot_provider)
+            cache = LRUPerceptionCache(max_entries=10)
+            return CachedPerceptionProvider(underlying_provider=base_provider, cache=cache)
+        except Exception as e:
+            print(f"Failed to build stage 23 perception provider: {e}")
             return None
 
     def _build_local_decision_engine(self) -> Optional[Any]:

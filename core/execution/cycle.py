@@ -42,6 +42,10 @@ Stage 20 adds:
 
 from __future__ import annotations
 
+from vision.grounding.models import TargetSpec, TargetKind as GTargetKind, GroundingStatus
+from vision.grounding.engine import GroundingEngine
+from vision.observations.targets import TargetCandidate, GroundedTarget
+
 import asyncio
 import time
 from typing import Any, Callable, Optional , List
@@ -1379,6 +1383,7 @@ class ExecutionCycle:
             status = ExecutionStatus.CANCELLED
         else:
             status = ExecutionStatus.OBSERVATION_FAILED
+        print(f'XXX _observe perception_result.status = {perception_result.status}')
 
         self._emit_observability(
             "OBSERVATION_COMPLETED" if status == ExecutionStatus.SUCCESS else "OBSERVATION_FAILED",
@@ -1443,12 +1448,66 @@ class ExecutionCycle:
             else:
                 # Execute grounding
                 try:
-                    resolved_target = self._target_resolver.resolve(
-                        target_input,
-                        screen_width=getattr(observe_result.observation.screen, 'width', None) if hasattr(observe_result.observation, 'screen') else None,
-                        screen_height=getattr(observe_result.observation.screen, 'height', None) if hasattr(observe_result.observation, 'screen') else None,
-                    )
+                    # Stage 24: Advanced Grounding
+                    if isinstance(target_input, str) and step.target_kind in ("element", "ocr", "vision", "generic"):
+                        engine = GroundingEngine()
+                        # Simple NLP extraction for ordinal (e.g. "eighth result" -> ordinal=8)
+                        ordinal = None
+                        tq = target_input.lower()
+                        ord_map = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "last": -1}
+                        for k, v in ord_map.items():
+                            if k in tq:
+                                ordinal = v
+                                break
+                        
+                        spec = TargetSpec(
+                            semantic_name=target_input,
+                            text=target_input,
+                            target_kind=GTargetKind.ELEMENT,
+                            ordinal=ordinal
+                        )
+                        g_result = engine.ground(spec, observe_result.observation)
+                        
+                        if g_result.status == GroundingStatus.RESOLVED and g_result.target:
+                            resolved_target = TargetResolutionResult(
+                                status=TargetResolutionStatus.RESOLVED,
+                                target=ResolvedTarget(
+                                    source=g_result.target.candidate.source_type.name,
+                                    confidence=g_result.confidence,
+                                    bounds=g_result.target.candidate.bbox,
+                                    center_x=int((g_result.target.candidate.bbox[0] + g_result.target.candidate.bbox[2])/2),
+                                    center_y=int((g_result.target.candidate.bbox[1] + g_result.target.candidate.bbox[3])/2),
+                                    timestamp=g_result.target.candidate.timestamp,
+                                    text=g_result.target.candidate.text,
+                                    properties=g_result.target.candidate.properties,
+                                    observation_id=g_result.observation_id
+                                ),
+                                reason="Grounded via Stage 24 Advanced Grounding",
+                                details=g_result.diagnostics
+                            )
+                        elif g_result.status == GroundingStatus.AMBIGUOUS:
+                            resolved_target = TargetResolutionResult(
+                                status=TargetResolutionStatus.AMBIGUOUS,
+                                target=None,
+                                reason=g_result.reason,
+                                details={"candidates": len(g_result.candidates)}
+                            )
+                        else:
+                            resolved_target = TargetResolutionResult(
+                                status=TargetResolutionStatus.NOT_FOUND,
+                                target=None,
+                                reason=g_result.reason,
+                                details={}
+                            )
+                    else:
+                        resolved_target = self._target_resolver.resolve(
+                            target_input,
+                            screen_width=getattr(observe_result.observation.screen, 'width', None) if hasattr(observe_result.observation, 'screen') else None,
+                            screen_height=getattr(observe_result.observation.screen, 'height', None) if hasattr(observe_result.observation, 'screen') else None,
+                        )
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     resolved_target = TargetResolutionResult(
                         status=TargetResolutionStatus.UNSUPPORTED,
                         target=None,
@@ -1912,8 +1971,8 @@ class ExecutionCycle:
         return PerceptionRequest(
             include_screenshot=True,
             include_vision=True,
-            include_ocr=False,  # OCR is expensive, enable only when needed
-            include_ui_elements=False,  # UI elements are expensive, enable only when needed
+            include_ocr=True,
+            include_ui_elements=True,
             include_window_context=True,
             region=None,
             max_age_ms=None,  # Let the provider/cache handle freshness

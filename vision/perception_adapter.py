@@ -160,51 +160,6 @@ class PerceptionAdapter(PerceptionProvider):
             if request.include_window_context:
                 active_window = self._get_window_context()
                 
-                # Enumerate all visible windows
-                try:
-                    import ctypes
-                    from ctypes import wintypes
-                    user32 = ctypes.windll.user32
-                    
-                    def enum_windows_proc(hwnd, lParam):
-                        if user32.IsWindowVisible(hwnd):
-                            length = user32.GetWindowTextLengthW(hwnd)
-                            if length > 0:
-                                buffer = ctypes.create_unicode_buffer(length + 1)
-                                user32.GetWindowTextW(hwnd, buffer, length + 1)
-                                title = buffer.value
-                                
-                                rect = wintypes.RECT()
-                                bounds = None
-                                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                                    bounds = (rect.left, rect.top, rect.right, rect.bottom)
-                                
-                                # Extract process
-                                pid = ctypes.c_ulong()
-                                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                                app_name = None
-                                try:
-                                    import psutil
-                                    app_name = psutil.Process(pid.value).name().lower().rstrip('.exe')
-                                    if app_name:
-                                        applications_set.add(app_name)
-                                except Exception:
-                                    pass
-                                    
-                                windows_list.append(WindowContext(
-                                    hwnd=hwnd,
-                                    title=title,
-                                    application=app_name,
-                                    bounds=bounds,
-                                    is_foreground=(active_window and active_window.hwnd == hwnd)
-                                ))
-                        return True
-                        
-                    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-                    user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
-                except Exception:
-                    pass
-            
             # 3. LAYER C: Elements & Text Regions
             target_query = "*"
             elements = []
@@ -221,29 +176,18 @@ class PerceptionAdapter(PerceptionProvider):
                     pass
                 except Exception:
                     pass
-                    
-                # Run OCR Strategy specifically for text if requested
-                if request.include_ocr and screenshot_bytes:
-                    try:
-                        from vision.strategies.ocr_strategy import OCRStrategy
-                        ocr = OCRStrategy()
-                        if ocr:
-                            import tempfile
-                            import os
-                            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                                tmp_path = tmp.name
-                                tmp.write(screenshot_bytes)
-                            try:
-                                text_regions = ocr.find_targets(target_query=target_query, image_path=tmp_path)
-                            finally:
-                                if os.path.exists(tmp_path):
-                                    os.unlink(tmp_path)
-                    except ImportError:
-                        pass
-                    except Exception:
-                        pass
-                        
-            except (AmbiguityError, TargetNotGroundedError):
+
+                # Run OCR Strategy specifically for text_regions
+                try:
+                    from vision.strategies.ocr_strategy import OCRStrategy
+                    ocr = OCRStrategy()
+                    if ocr:
+                        text_regions = ocr.find_targets(target_query=target_query, image_path=screenshot_path)
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+            except Exception:
                 pass
                 
             # Filter and deduplicate elements and text_regions if necessary
@@ -262,164 +206,30 @@ class PerceptionAdapter(PerceptionProvider):
                 screenshot_available=screenshot_bytes is not None and request.include_screenshot,
                 needs_screenshot=needs_screenshot
             )
-
-            duration_ms = (time.time() - start_time) * 1000
-
+            
             return PerceptionResult(
-                observation_id="",
+                observation_id=str(uuid4()),
                 timestamp=None,
                 screen=self._get_screen_info(),
                 screenshot=screenshot_bytes,
                 candidates=tuple(all_candidates),
                 window_context=active_window,
-                active_window=active_window,
-                windows=tuple(windows_list),
-                applications=tuple(applications_set),
-                elements=tuple(elements),
-                text_regions=tuple(text_regions),
-                sources=tuple(perception_sources),
-                duration_ms=duration_ms,
                 status=status,
-                metadata={
-                    "needs_screenshot": needs_screenshot,
-                    "screenshot_used": screenshot_bytes is not None
-                }
+                sources=tuple(perception_sources),
+                duration_ms=(time.time() - start_time) * 1000
             )
 
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            duration_ms = (time.time() - start_time) * 1000
+            logger.error(f"[vision] Perception failed: {e}")
             return PerceptionResult(
                 observation_id="",
                 timestamp=None,
                 screen=self._get_screen_info(),
                 status=PerceptionStatus.FAILED,
-                duration_ms=duration_ms,
-                metadata={
-                    "error": str(e),
-                    "error_type": type(e).__name__
-                }
+                duration_ms=(time.time() - start_time) * 1000
             )
 
-    def _needs_screenshot(self, request: PerceptionRequest) -> bool:
-        """Determine if the current request needs a screenshot based on enabled strategies."""
-        # If any requested perception source requires a screenshot, we need one
-        # For simplicity, we'll check if vision or OCR is requested
-        if request.include_vision or request.include_ocr:
-            return True
-        # Check if any of the active strategies require screenshots
-        # This is a simplified check - in practice we'd query the strategies
-        return False
-
-    def _convert_observation_sources(
-        self,
-        sources: List[ObservationSource]
-    ) -> List[PerceptionSource]:
-        """Convert ObservationSource enums to PerceptionSource enums."""
-        source_map = {
-            ObservationSource.UIA: PerceptionSource.UI_AUTOMATION,
-            ObservationSource.OCR: PerceptionSource.OCR,
-            ObservationSource.VISION: PerceptionSource.VISION,
-            ObservationSource.SCREEN: PerceptionSource.COORDINATE,
-            ObservationSource.DERIVED: PerceptionSource.COORDINATE,
-        }
-
-        result = []
-        for source in sources:
-            if source in source_map:
-                result.append(source_map[source])
-            else:
-                # Default to UI_AUTOMATION for unknown sources
-                result.append(PerceptionSource.UI_AUTOMATION)
-
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_result = []
-        for source in result:
-            if source not in seen:
-                seen.add(source)
-                unique_result.append(source)
-        return unique_result
-
-    def _get_screen_info(self) -> ScreenInfo:
-        """Get current screen information."""
-        # Try to get real monitor info
-        try:
-            from vision.screen.monitor import enumerate_monitors
-            monitors = enumerate_monitors()
-            if monitors:
-                # Use primary monitor for now
-                primary = monitors[0]
-                return ScreenInfo(
-                    width=primary.width,
-                    height=primary.height,
-                    dpi_scale_x=primary.dpi_scale,
-                    dpi_scale_y=primary.dpi_scale,
-                    monitor_id=str(primary.device_id) if hasattr(primary, 'device_id') else None
-                )
-        except Exception:
-            pass
-
-        # Fallback to default values
-        return ScreenInfo(
-            width=1920,
-            height=1080,
-            dpi_scale_x=1.0,
-            dpi_scale_y=1.0,
-            monitor_id=None
-        )
-
     def _get_window_context(self) -> Optional[WindowContext]:
-        """Get current window context information."""
-        try:
-            # Try to get foreground window info
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
-
-            if hwnd:
-                # Get window text
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buffer = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(hwnd, buffer, length + 1)
-                    title = buffer.value
-                else:
-                    title = None
-
-                # Get window rect
-                rect = wintypes.RECT()
-                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                    bounds = (rect.left, rect.top, rect.right, rect.bottom)
-                else:
-                    bounds = None
-
-                # Get process name/application
-                try:
-                    process_id = wintypes.DWORD()
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-                    # In a full implementation, we'd open the process and get the name
-                    # For now, we'll leave it as None
-                    application = None
-                except Exception:
-                    application = None
-
-                # Check if it's foreground (should be true since we called GetForegroundWindow)
-                is_foreground = True
-
-                return WindowContext(
-                    hwnd=hwnd,
-                    title=title,
-                    application=application,
-                    bounds=bounds,
-                    is_foreground=is_foreground
-                )
-        except Exception:
-            pass
-
         return None
 
     def _determine_perception_status(

@@ -633,7 +633,7 @@ class TaskExecutor:
         self, step: TaskStep, plan: TaskPlan, completed_step_ids: FrozenSet[str]
     ) -> Dict[str, Any]:
         """Execute a single task step using the PlanExecutor."""
-        logger.debug(f"Executing task step via PlanExecutor: {step.step_id}")
+        print(f"Executing task step via PlanExecutor: {step.step_id}")
 
         # Convert TaskStep back to PlanStep
         plan_step = self._convert_task_step_to_plan_step(step, plan)
@@ -674,6 +674,7 @@ class TaskExecutor:
         # Execute using PlanExecutor
         try:
             execution_result: ExecutionResult = self.plan_executor.execute(context)
+            print(f"PlanExecutor execution_result: {execution_result}")
 
             # Convert ExecutionResult to task step result format
             return {
